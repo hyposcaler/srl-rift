@@ -1,0 +1,10 @@
+rift-srl:
+  path: /usr/local/bin
+  launch-command: rift-srl
+  config-delivery-format: json
+  failure-action: wait=10
+  yang-modules:
+    names:
+      - "rift-srl"
+    source-directories:
+      - "/opt/rift-srl/yang"

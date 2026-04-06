@@ -1,0 +1,37 @@
+name: rift
+
+topology:
+  kinds:
+    srl:
+      image: ghcr.io/nokia/srlinux:latest
+  nodes:
+    spine1:
+      kind: srl
+      type: ixr-d2l
+      startup-config: configs/spine1.cfg
+    spine2:
+      kind: srl
+      type: ixr-d2l
+      startup-config: configs/spine2.cfg
+    leaf1:
+      kind: srl
+      type: ixr-d3l
+      startup-config: configs/leaf1.cfg
+    leaf2:
+      kind: srl
+      type: ixr-d3l
+      startup-config: configs/leaf2.cfg
+    leaf3:
+      kind: srl
+      type: ixr-d3l
+      startup-config: configs/leaf3.cfg
+
+  links:
+    # spine1 to leaves
+    - endpoints: ["spine1:e1-1", "leaf1:e1-1"]
+    - endpoints: ["spine1:e1-2", "leaf2:e1-1"]
+    - endpoints: ["spine1:e1-3", "leaf3:e1-1"]
+    # spine2 to leaves
+    - endpoints: ["spine2:e1-1", "leaf1:e1-2"]
+    - endpoints: ["spine2:e1-2", "leaf2:e1-2"]
+    - endpoints: ["spine2:e1-3", "leaf3:e1-2"]

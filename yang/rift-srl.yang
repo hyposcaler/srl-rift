@@ -1,0 +1,66 @@
+module rift-srl {
+  yang-version 1.1;
+  namespace "srlinux.dev/ndk/rift-srl";
+  prefix "rift-srl";
+
+  description
+    "YANG module for the RIFT protocol NDK agent (RFC 9692)";
+
+  revision "2025-04-06" {
+    description "M0: initial scaffolding";
+  }
+
+  container rift {
+    description
+      "Root container for RIFT protocol agent";
+
+    leaf admin-state {
+      description "Administrative state of the RIFT agent";
+      type enumeration {
+        enum enable {
+          description "Enable the RIFT agent";
+        }
+        enum disable {
+          description "Disable the RIFT agent";
+        }
+      }
+      default "enable";
+    }
+
+    leaf system-id {
+      description "RIFT system identifier (unsigned 64-bit)";
+      type uint64;
+    }
+
+    leaf level {
+      description "Level of this node in the RIFT fabric (0=leaf)";
+      type uint8 {
+        range "0..24";
+      }
+      default "0";
+    }
+
+    leaf oper-state {
+      description "Operational state of the RIFT agent";
+      config false;
+      type enumeration {
+        enum up {
+          description "Agent is running";
+        }
+        enum down {
+          description "Agent is not running";
+        }
+      }
+    }
+
+    list interface {
+      description "RIFT-enabled interfaces";
+      key "name";
+
+      leaf name {
+        description "SR Linux interface name (e.g., ethernet-1/1)";
+        type string;
+      }
+    }
+  }
+}

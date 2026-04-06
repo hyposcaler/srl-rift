@@ -1,0 +1,37 @@
+# Build artifacts
+rift-srl
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.dll
+
+# Go
+/bin/
+/pkg/
+vendor/
+.go/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artifacts
+*.test
+*.cover
+*.out
+
+# Containerlab runtime (generated)
+lab/clab-rift/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local Claude settings
+.claude/settings.local.json
