@@ -3,7 +3,7 @@ name: rift
 topology:
   kinds:
     srl:
-      image: ghcr.io/nokia/srlinux:latest
+      image: ghcr.io/nokia/srlinux:26.3.1
     linux:
       image: ghcr.io/srl-labs/network-multitool
   nodes:

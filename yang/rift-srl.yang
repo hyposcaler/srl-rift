@@ -6,8 +6,8 @@ module rift-srl {
   description
     "YANG module for the RIFT protocol NDK agent (RFC 9692)";
 
-  revision "2026-04-06" {
-    description "M2: TIE origination and flooding";
+  revision "2026-04-07" {
+    description "M6: Polish and documentation";
   }
 
   container rift {
@@ -106,6 +106,36 @@ module rift-srl {
 
     leaf rib-summary {
       description "Summary of routes computed by SPF";
+      config false;
+      type string;
+    }
+
+    leaf spf-runs {
+      description "Number of SPF computations performed";
+      config false;
+      type uint64;
+    }
+
+    leaf adjacency-count {
+      description "Number of adjacencies in three-way state";
+      config false;
+      type uint32;
+    }
+
+    leaf lsdb-tie-count {
+      description "Number of TIEs in the link-state database";
+      config false;
+      type uint32;
+    }
+
+    leaf route-count {
+      description "Number of routes computed by SPF";
+      config false;
+      type uint32;
+    }
+
+    leaf disaggregation-summary {
+      description "Active positive disaggregation prefixes, or none";
       config false;
       type string;
     }

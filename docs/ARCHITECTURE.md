@@ -1,8 +1,8 @@
 # ARCHITECTURE.md
 
 ## Current Status
-**Active milestone:** M6 (Polish)
-**Last completed:** M5 (Disaggregation)
+**Active milestone:** None (all milestones complete)
+**Last completed:** M6 (Polish)
 **Blockers:** None
 
 ## Overview
@@ -15,6 +15,84 @@ See CLAUDE.md for conventions and orientation.
 ## Lab
 Containerlab with SR Linux nodes. Topology in lab/topology.clab.yml.
 2 spines (level 1), 3 leaves (level 0), full mesh, 6 links.
+
+## Key Implementation Challenges
+
+### Multicast Reception on SR Linux
+
+RIFT uses UDP multicast (224.0.0.121:914) for LIE neighbor discovery. SR Linux
+splits each physical interface across two network namespaces: `srbase` holds the
+parent interface (`e1-1`) with L2/link-local connectivity, while `srbase-default`
+holds the subinterface (`e1-1.0`) with IPv4 addresses. These are connected by an
+internal veth pair, and the `sr_xdp_lc_1` datapath bridges traffic between them
+using L3 FIB lookups for unicast.
+
+The problem: multicast has no FIB entries. Packets arriving on the wire reach the
+parent interface in `srbase` and stop there. They never cross to `srbase-default`.
+This was verified by eight different approaches (IGMP joins, ALLMULTI, CPM ACL
+counters, tc mirred, etc.), all documented in the M0 decisions below. The root
+cause is that `sr_xdp_lc_1` performs no multicast forwarding
+(`/proc/net/ip_mr_cache` empty, `mc_forwarding=0`). This may be specific to the
+containerized datapath; real hardware ASICs may behave differently.
+
+**Solution:** Create multicast receive sockets in `srbase` (where multicast
+actually arrives) using `runtime.LockOSThread()` + `netns.Set()`. Once a socket
+fd is created, it remains bound to its creation namespace regardless of which
+OS thread later uses it. Multicast send still goes from `srbase-default` (which
+has real source IPs); the packet traverses the veth to the parent and goes on the
+wire. The peer's recv socket in `srbase` picks it up with the real source IP.
+
+See M0 decision "Socket Architecture" for the full socket model, and the
+"Multicast investigation" section for reproduction steps.
+
+### Namespace Switching in Go
+
+The agent must operate in both `srbase` (multicast recv) and `srbase-default`
+(unicast, address discovery, flood sockets) simultaneously. Linux namespace
+switching via `setns(2)` is per-thread, but Go's goroutine scheduler freely
+migrates goroutines across OS threads.
+
+**Solution:** `runtime.LockOSThread()` pins the goroutine to a dedicated OS
+thread before calling `netns.Set()`. The pattern for socket creation is:
+
+1. Lock goroutine to OS thread
+2. Save current namespace fd
+3. Switch to target namespace (`srbase-default`)
+4. Create and configure socket (bind, setsockopt)
+5. Restore original namespace
+6. Unlock OS thread
+
+After creation, the socket fd works from any thread/namespace. This is used for:
+multicast send sockets, flood (TIE unicast) sockets, interface address discovery,
+and subinterface index lookups. The multicast recv socket needs no switch because
+the agent process already runs in `srbase` (where app manager launches it).
+
+An additional wrinkle: the agent runs as the unprivileged `srlinux` user. The
+`srbase` namespace has `ip_unprivileged_port_start=0` (any port allowed), but
+`srbase-default` uses the default of 1024. RIFT's TIE flood port 915 is below
+this threshold. The deploy script sets
+`sysctl net.ipv4.ip_unprivileged_port_start=0` in `srbase-default` before
+starting the agent.
+
+### Local Prefix Discovery
+
+RIFT only runs LIE/adjacency on fabric-facing links. But leaf nodes must
+advertise host-facing prefixes (e.g., `10.10.1.0/24`) northbound in their North
+Prefix TIEs. RFC 9692 does not define configuration for non-RIFT interfaces; it
+leaves local prefix discovery as an implementation detail.
+
+**Solution:** At startup, enumerate all IPv4 interfaces in `srbase-default` via
+Go's `net.Interfaces()` + `Addrs()`. This discovers loopbacks (`system0.0`,
+mapped to /32), fabric link subnets, and host-facing subnets. Internal SR Linux
+interfaces are filtered: `lo` (loopback flag), `gateway`, `mgmt0.0`, and any
+127.x.x.x addresses.
+
+**Tradeoff:** This couples prefix origination to Linux namespace state. Any
+interface that happens to exist in `srbase-default` gets advertised. For the lab
+topology this is correct, but a production implementation would want config-driven
+prefix selection (explicit prefix list or passive interface flag).
+
+See M4 decision "Local Prefix Discovery via Namespace Enumeration" for details.
 
 ## Decisions Log
 
@@ -476,4 +554,23 @@ from leaves that would otherwise blackhole via spine1.
 - SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M6: Polish
-<!-- filled in after M6 gate passes -->
+
+### Decisions Log
+
+#### M6: Telemetry Scalars Over YANG Lists
+**Choice:** New state leaves are scalar counters and string summaries, not YANG list entries
+**Why:** The M2 decision established that NDK telemetry cannot push to YANG list entries
+with composite enumeration keys. Scalar leaves (`spf-runs`, `adjacency-count`,
+`lsdb-tie-count`, `route-count`) and string summaries (`disaggregation-summary`) work
+reliably with the NDK `TelemetryAddOrUpdate` API, following the same pattern as the
+existing `lsdb-summary` and `rib-summary` leaves.
+
+### Gate Results
+- YANG model: 6 config leaves, 12 state leaves (oper-state, per-interface adjacency, lsdb-summary, rib-summary, spf-runs, adjacency-count, lsdb-tie-count, route-count, disaggregation-summary)
+- Full telemetry: counters and disaggregation state pushed to IDB alongside existing summaries
+- README.md: architecture, build, lab setup, demo walkthrough, YANG reference
+- verify.sh: 27 checks (agent status, adjacencies, LSDB, routes, host-to-host ping, disaggregation failure/recovery)
+- All unit tests: 26 test functions, 122 subtests passing (encoding 4, LIE FSM 5+subtests, transport 1, TIE 7+subtests, SPF 9+subtests)
+- Lab verification: 23/23 base checks + 4/4 disaggregation checks = 27/27 ALL PASSED
+- Reproducible demo from clone to working fabric confirmed
+- SR Linux version: v26.3.1, NDK proto v0.5.0

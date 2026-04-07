@@ -42,6 +42,10 @@ type Agent struct {
 	// Tracks routes currently programmed in FIB via NDK.
 	programmedRIB map[string]programmedRoute
 
+	// Counters and state for telemetry.
+	spfRuns            uint64
+	lastDisaggPrefixes []encoding.PrefixEntry
+
 	mu sync.Mutex
 }
 
@@ -363,6 +367,7 @@ func (a *Agent) eventLoop(ctx context.Context) error {
 
 		case <-spfTimerC:
 			a.spfEngine.Run()
+			a.spfRuns++
 
 			// Positive disaggregation: spines check if any south
 			// neighbors are unreachable from same-level peers.
@@ -558,6 +563,8 @@ func (a *Agent) runDisaggregation() {
 			Attributes: encoding.PrefixAttributes{Metric: dp.Distance},
 		})
 	}
+
+	a.lastDisaggPrefixes = prefixEntries
 
 	// Non-blocking send: if the flood engine hasn't consumed the last update,
 	// drain it and send the new one.
@@ -855,6 +862,19 @@ func (a *Agent) discoverLocalPrefixes() []tie.LocalPrefix {
 	return prefixes
 }
 
+// disaggSummaryString builds a human-readable disaggregation summary.
+func (a *Agent) disaggSummaryString() string {
+	if len(a.lastDisaggPrefixes) == 0 {
+		return "none"
+	}
+	var parts []string
+	for _, pe := range a.lastDisaggPrefixes {
+		parts = append(parts, fmt.Sprintf("%s metric=%d",
+			spf.PrefixToString(pe.Prefix), pe.Attributes.Metric))
+	}
+	return strings.Join(parts, " | ")
+}
+
 // ribSummaryString builds a human-readable RIB summary.
 func (a *Agent) ribSummaryString() string {
 	if a.spfEngine == nil {
@@ -921,11 +941,21 @@ func (a *Agent) updateStateTelemetry(ctx context.Context) {
 	})
 
 	telem := struct {
-		LSDBSummary string `json:"lsdb-summary"`
-		RIBSummary  string `json:"rib-summary,omitempty"`
+		LSDBSummary          string `json:"lsdb-summary"`
+		RIBSummary           string `json:"rib-summary,omitempty"`
+		SPFRuns              uint64 `json:"spf-runs"`
+		AdjacencyCount       uint32 `json:"adjacency-count"`
+		LSDBTIECount         uint32 `json:"lsdb-tie-count"`
+		RouteCount           uint32 `json:"route-count"`
+		DisaggregationSummary string `json:"disaggregation-summary"`
 	}{
-		LSDBSummary: formatLSDBSummary(ties),
-		RIBSummary:  a.ribSummaryString(),
+		LSDBSummary:          formatLSDBSummary(ties),
+		RIBSummary:           a.ribSummaryString(),
+		SPFRuns:              a.spfRuns,
+		AdjacencyCount:       uint32(len(a.floodEngine.Adjacencies())),
+		LSDBTIECount:         uint32(a.floodEngine.LSDB().Len()),
+		RouteCount:           uint32(len(a.spfEngine.RIB())),
+		DisaggregationSummary: a.disaggSummaryString(),
 	}
 
 	if err := a.ndk.UpdateTelemetry(ctx, ".rift", telem); err != nil {
