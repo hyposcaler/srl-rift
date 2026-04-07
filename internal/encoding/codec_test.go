@@ -2,6 +2,7 @@ package encoding
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -312,5 +313,106 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Payload, original.Payload) {
 		t.Errorf("payload: got %q, want %q", decoded.Payload, original.Payload)
+	}
+}
+
+// thriftFieldHeader returns the binary encoding of a Thrift field header.
+func thriftFieldHeader(fieldType byte, fieldID int16) []byte {
+	var buf [3]byte
+	buf[0] = fieldType
+	binary.BigEndian.PutUint16(buf[1:], uint16(fieldID))
+	return buf[:]
+}
+
+// thriftListHeader returns element-type byte + i32 count for a list/set.
+func thriftListHeader(elemType byte, count int32) []byte {
+	var buf [5]byte
+	buf[0] = elemType
+	binary.BigEndian.PutUint32(buf[1:], uint32(count))
+	return buf[:]
+}
+
+// thriftMapHeader returns key-type, value-type, i32 count for a map.
+func thriftMapHeader(keyType, valType byte, count int32) []byte {
+	var buf [6]byte
+	buf[0] = keyType
+	buf[1] = valType
+	binary.BigEndian.PutUint32(buf[2:], uint32(count))
+	return buf[:]
+}
+
+func TestDecoderBoundsCheck(t *testing.T) {
+	huge := int32(0x7FFFFFFF)
+
+	tests := []struct {
+		name   string
+		decode func(d *Decoder) error
+		data   []byte
+	}{
+		{
+			name: "TIDE oversized headers list",
+			decode: func(d *Decoder) error {
+				var p TIDEPacket
+				return d.decodeTIDEPacket(&p)
+			},
+			// field 3 (list<struct>), huge count
+			data: append(thriftFieldHeader(thriftTypeList, 3),
+				thriftListHeader(thriftTypeStruct, huge)...),
+		},
+		{
+			name: "TIRE oversized headers set",
+			decode: func(d *Decoder) error {
+				var p TIREPacket
+				return d.decodeTIREPacket(&p)
+			},
+			// field 1 (set<struct>), huge count
+			data: append(thriftFieldHeader(thriftTypeSet, 1),
+				thriftListHeader(thriftTypeStruct, huge)...),
+		},
+		{
+			name: "NodeTIE oversized neighbors map",
+			decode: func(d *Decoder) error {
+				var n NodeTIEElement
+				return d.decodeNodeTIEElement(&n)
+			},
+			// field 3 (level, i16), then field 2 (map<i64,struct>), huge count
+			data: func() []byte {
+				var buf []byte
+				// field 3 (level) - skip it to reach field 2...
+				// Actually field 2 is the neighbors map.
+				buf = append(buf, thriftFieldHeader(thriftTypeMap, 2)...)
+				buf = append(buf, thriftMapHeader(thriftTypeI64, thriftTypeStruct, huge)...)
+				return buf
+			}(),
+		},
+		{
+			name: "PrefixTIE oversized prefixes map",
+			decode: func(d *Decoder) error {
+				var p PrefixTIEElement
+				return d.decodePrefixTIEElement(&p)
+			},
+			// field 1 (map<struct,struct>), huge count
+			data: append(thriftFieldHeader(thriftTypeMap, 1),
+				thriftMapHeader(thriftTypeStruct, thriftTypeStruct, huge)...),
+		},
+		{
+			name: "negative collection length",
+			decode: func(d *Decoder) error {
+				var p TIDEPacket
+				return d.decodeTIDEPacket(&p)
+			},
+			data: append(thriftFieldHeader(thriftTypeList, 3),
+				thriftListHeader(thriftTypeStruct, -1)...),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dec := NewDecoder(bytes.NewReader(tt.data))
+			err := tt.decode(dec)
+			if err == nil {
+				t.Fatal("expected error for oversized collection, got nil")
+			}
+		})
 	}
 }

@@ -499,12 +499,13 @@ func (a *Agent) handleAdjacencyEvent(ctx context.Context, ev lie.AdjacencyEvent)
 		a.floodEngine.AdjChangeCh <- tie.AdjacencyChange{
 			InterfaceName: ev.InterfaceName,
 			Info: &tie.AdjacencyInfo{
-				InterfaceName: ev.InterfaceName,
-				NeighborID:    ev.Neighbor.SystemID,
-				NeighborLevel: ev.Neighbor.Level,
-				NeighborAddr:  ev.Neighbor.Address,
-				FloodPort:     ev.Neighbor.FloodPort,
-				LocalLinkID:   encoding.LinkIDType(iface.transport.LocalID()),
+				InterfaceName:  ev.InterfaceName,
+				NeighborID:     ev.Neighbor.SystemID,
+				NeighborLevel:  ev.Neighbor.Level,
+				NeighborAddr:   ev.Neighbor.Address,
+				FloodPort:      ev.Neighbor.FloodPort,
+				LocalLinkID:    encoding.LinkIDType(iface.transport.LocalID()),
+				NeighborLinkID: ev.Neighbor.LinkID,
 			},
 		}
 	} else if ev.State != lie.ThreeWay {
@@ -541,40 +542,8 @@ func nhAddrsEqual(a, b []netip.Addr) bool {
 	return true
 }
 
+
 // syncRoutes pushes the full RIB to NDK using SyncStart/SyncEnd. SyncEnd
-// runDisaggregation computes positive disaggregation prefixes and sends
-// them to the flood engine for TIE origination or withdrawal.
-func (a *Agent) runDisaggregation() {
-	entries := a.floodEngine.LSDB().Snapshot()
-	adjs := a.floodEngine.Adjacencies()
-	southRIB := a.spfEngine.SouthRIB()
-	if southRIB == nil {
-		return
-	}
-
-	disaggPrefixes := spf.ComputeDisaggregation(
-		a.cfg.SystemID, a.cfg.Level, adjs, entries, southRIB, a.logger)
-
-	// Convert to encoding.PrefixEntry for the flood engine.
-	var prefixEntries []encoding.PrefixEntry
-	for _, dp := range disaggPrefixes {
-		prefixEntries = append(prefixEntries, encoding.PrefixEntry{
-			Prefix:     dp.Prefix,
-			Attributes: encoding.PrefixAttributes{Metric: dp.Distance},
-		})
-	}
-
-	a.lastDisaggPrefixes = prefixEntries
-
-	// Non-blocking send: if the flood engine hasn't consumed the last update,
-	// drain it and send the new one.
-	select {
-	case <-a.floodEngine.DisaggUpdateCh:
-	default:
-	}
-	a.floodEngine.DisaggUpdateCh <- prefixEntries
-}
-
 // automatically removes any routes not added during the sync window, so
 // we must push ALL current routes every time (not just deltas). NHGs are
 // only created/updated when their next-hops actually changed.

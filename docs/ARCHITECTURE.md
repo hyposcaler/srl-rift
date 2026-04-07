@@ -1,9 +1,9 @@
 # ARCHITECTURE.md
 
 ## Current Status
-**Active milestone:** None (all milestones complete)
-**Last completed:** M6 (Polish)
-**Next available:** C1 (Correctness fixes) - see PLAN.md section 7a
+**Active milestone:** None
+**Last completed:** C1 (Correctness fixes)
+**Next available:** C2 (Agent refactor) or C3 (Decoder fuzzing) - see PLAN.md
 **Blockers:** None
 
 ## Overview
@@ -574,4 +574,50 @@ existing `lsdb-summary` and `rib-summary` leaves.
 - All unit tests: 26 test functions, 122 subtests passing (encoding 4, LIE FSM 5+subtests, transport 1, TIE 7+subtests, SPF 9+subtests)
 - Lab verification: 23/23 base checks + 4/4 disaggregation checks = 27/27 ALL PASSED
 - Reproducible demo from clone to working fabric confirmed
+- SR Linux version: v26.3.1, NDK proto v0.5.0
+
+## C1: Correctness Fixes
+
+### Decisions Log
+
+#### C1: LSDB Snapshot Deep Copy
+**Choice:** `Snapshot()` deep-copies `LSDBEntry`, `TIEPacket`, and `TIEHeader` pointer fields
+**Why:** The previous implementation returned a map of pointers aliasing live LSDB data.
+`bumpOwnTIE` and `DecrementLifetimes` mutated entries in place while SPF read them from
+another goroutine, causing a data race.
+
+#### C1: Decoder Collection Length Bounds
+**Choice:** Added `readCollectionLen(max)` helper with cap of 10000 elements
+**Why:** All Thrift collection decode sites (`make([]T, n)`) read length from the wire
+without validation. A malicious or corrupt packet with a large length could OOM the agent.
+
+#### C1: TIDE Contiguous Range Tiling
+**Choice:** Extracted `buildTIDEChunks()` with contiguous range coverage
+**Why:** The previous loop had an off-by-one (empty trailing TIDE when headers count
+was an exact multiple of MaxTIDEHeaders) and gaps between chunk ranges. RFC 9692
+Section 4.2.3.3 requires contiguous coverage.
+
+#### C1: Leaf Level Acceptance
+**Choice:** Leaf nodes accept any neighbor level
+**Why:** RFC 9692 allows a leaf to peer with any non-leaf regardless of level. The
+previous implementation restricted leaf peers to level 0 or 1 only.
+
+#### C1: SystemID to LinkID Truncation
+**Choice:** Added `NeighborLinkID` to `AdjacencyInfo`, populated from LIE peer's `local_id`
+**Why:** `originateNorthNodeTIE` and `originateSouthNodeTIE` cast the 64-bit neighbor
+SystemID to a 32-bit LinkID for `RemoteID`, silently dropping upper bits.
+
+#### C1: Blocking Adjacency Event Send
+**Choice:** Changed `stateChangeCh` send from non-blocking to blocking
+**Why:** A dropped `ThreeWay -> OneWay` transition left zombie flood sockets and stale
+entries in the flood engine's adjacency map. The FSM has no real-time constraint that
+justifies dropping state changes.
+
+### Gate Results
+- All existing tests updated and passing
+- New tests: LSDB snapshot deep copy, TIDE chunk contiguous tiling (7 cases),
+  decoder bounds checks (5 cases), leaf level acceptance (10 cases)
+- `go test ./...` all pass
+- `go test -race ./...` clean
+- Production build compiles
 - SR Linux version: v26.3.1, NDK proto v0.5.0

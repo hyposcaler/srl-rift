@@ -39,6 +39,8 @@ func NewLSDB() *LSDB {
 }
 
 // Get returns the entry for the given TIEID, or nil if not found.
+// The returned pointer aliases the live LSDB entry. Callers must not
+// mutate it without holding the LSDB write lock. SPF must use Snapshot().
 func (db *LSDB) Get(id encoding.TIEID) *LSDBEntry {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -71,7 +73,8 @@ func (db *LSDB) Len() int {
 }
 
 // ForEachSorted iterates over all entries in TIEID total order.
-// The callback returns false to stop iteration.
+// The callback returns false to stop iteration. Entries are live
+// pointers; callers must not mutate them. SPF must use Snapshot().
 func (db *LSDB) ForEachSorted(fn func(encoding.TIEID, *LSDBEntry) bool) {
 	db.mu.RLock()
 	ids := make([]encoding.TIEID, 0, len(db.entries))
@@ -118,14 +121,30 @@ func (db *LSDB) HeadersSorted() []encoding.TIEHeaderWithLifeTime {
 	return headers
 }
 
-// Snapshot returns a consistent copy of all LSDB entries under a single
-// read lock. Used by SPF for point-in-time computation.
+// Snapshot returns a deep copy of all LSDB entries under a single read
+// lock. Used by SPF for point-in-time computation. The returned entries
+// are independent of the live LSDB and safe to read without locks.
+//
+// The copy covers LSDBEntry, TIEPacket, and the Header's pointer fields
+// (OriginationTime, OriginationLifetime). TIEElement contents (Node,
+// Prefixes, etc.) are shared because they are not mutated after insertion.
 func (db *LSDB) Snapshot() map[encoding.TIEID]*LSDBEntry {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	result := make(map[encoding.TIEID]*LSDBEntry, len(db.entries))
 	for id, entry := range db.entries {
-		result[id] = entry
+		entryCopy := *entry
+		pktCopy := *entry.Packet
+		if pktCopy.Header.OriginationLifetime != nil {
+			lt := *pktCopy.Header.OriginationLifetime
+			pktCopy.Header.OriginationLifetime = &lt
+		}
+		if pktCopy.Header.OriginationTime != nil {
+			ts := *pktCopy.Header.OriginationTime
+			pktCopy.Header.OriginationTime = &ts
+		}
+		entryCopy.Packet = &pktCopy
+		result[id] = &entryCopy
 	}
 	return result
 }

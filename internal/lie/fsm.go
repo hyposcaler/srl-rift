@@ -393,11 +393,7 @@ func (f *FSM) enterState(newState State) {
 		nbr := *f.neighbor
 		ev.Neighbor = &nbr
 	}
-	select {
-	case f.stateChangeCh <- ev:
-	default:
-		f.logger.Warn("adjacency event channel full, dropping")
-	}
+	f.stateChangeCh <- ev
 }
 
 // cleanup implements the CLEANUP procedure: delete current neighbor.
@@ -548,11 +544,10 @@ func (f *FSM) checkThreeWay(lie *encoding.LIEPacket) {
 
 // levelAcceptable checks if the remote level is acceptable per RFC 9692.
 func (f *FSM) levelAcceptable(remoteLevel encoding.LevelType) bool {
-	// If this node is a leaf (level 0), accept any level that is
-	// at most 1 away, OR the remote is also a leaf.
+	// If this node is a leaf (level 0), accept any neighbor level.
+	// RFC 9692 allows a leaf to peer with any non-leaf regardless of level.
 	if f.level == encoding.LeafLevel {
-		// Leaf accepts neighbors at level 0 or 1.
-		return remoteLevel == encoding.LeafLevel || remoteLevel == 1
+		return true
 	}
 
 	// If remote is a leaf, always accept.

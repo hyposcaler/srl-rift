@@ -247,3 +247,55 @@ func TestLSDB_DecrementLifetimes(t *testing.T) {
 		t.Errorf("id2 lifetime = %d, want 89", entry.RemainingLifetime)
 	}
 }
+
+func TestSnapshotDeepCopy(t *testing.T) {
+	db := NewLSDB()
+
+	origLifetime := encoding.LifeTimeInSecType(3600)
+	id := encoding.TIEID{
+		Direction:  encoding.TieDirectionNorth,
+		Originator: 100,
+		TIEType:    encoding.TIETypeNodeTIEType,
+		TIENr:      1,
+	}
+	db.Insert(&LSDBEntry{
+		Packet: &encoding.TIEPacket{
+			Header: encoding.TIEHeader{
+				TIEID:               id,
+				SeqNr:               1,
+				OriginationLifetime: &origLifetime,
+			},
+		},
+		RemainingLifetime: 3600,
+		LastReceived:      time.Now(),
+		SelfOriginated:    true,
+	})
+
+	// Take snapshot.
+	snap := db.Snapshot()
+
+	// Mutate the live entry (simulating bumpOwnTIE).
+	live := db.Get(id)
+	live.Packet.Header.SeqNr = 99
+	newLT := encoding.LifeTimeInSecType(7200)
+	live.Packet.Header.OriginationLifetime = &newLT
+
+	// Snapshot must be unaffected.
+	snapEntry := snap[id]
+	if snapEntry.Packet.Header.SeqNr != 1 {
+		t.Errorf("snapshot SeqNr = %d, want 1", snapEntry.Packet.Header.SeqNr)
+	}
+	if *snapEntry.Packet.Header.OriginationLifetime != 3600 {
+		t.Errorf("snapshot OriginationLifetime = %d, want 3600",
+			*snapEntry.Packet.Header.OriginationLifetime)
+	}
+
+	// Decrement lifetimes on live LSDB.
+	db.DecrementLifetimes(10)
+
+	// Snapshot RemainingLifetime must be unaffected.
+	if snapEntry.RemainingLifetime != 3600 {
+		t.Errorf("snapshot RemainingLifetime = %d after DecrementLifetimes, want 3600",
+			snapEntry.RemainingLifetime)
+	}
+}

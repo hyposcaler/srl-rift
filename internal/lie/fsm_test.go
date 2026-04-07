@@ -243,15 +243,15 @@ func TestFSMTransitions(t *testing.T) {
 			wantState: OneWay,
 		},
 		{
-			name:  "level difference > 1 is unacceptable (non-leaf)",
+			name:  "leaf accepts any level neighbor",
 			setup: func(f *FSM, mt *mockTransport) {},
 			action: func(f *FSM) {
-				// Our node is leaf (level 0). Remote at level 3 is unacceptable
-				// because leaf only accepts 0 or 1.
+				// Our node is leaf (level 0). RFC 9692 allows a leaf
+				// to peer with any non-leaf regardless of level.
 				pkt := makeLIEPacket(100, 3, 99, nil)
 				f.HandlePacket(pkt, netip.MustParseAddr("10.1.1.0"))
 			},
-			wantState: OneWay,
+			wantState: TwoWay,
 		},
 		{
 			name: "MultipleNeighbors to MultipleNeighborsWait",
@@ -415,5 +415,34 @@ func TestFullThreeWayHandshake(t *testing.T) {
 	}
 	if !hasThreeWay(eventsB) {
 		t.Error("fsmB did not emit ThreeWay adjacency event")
+	}
+}
+
+func TestLeafLevelAcceptance(t *testing.T) {
+	tests := []struct {
+		name        string
+		localLevel  encoding.LevelType
+		remoteLevel encoding.LevelType
+		want        bool
+	}{
+		{"leaf accepts level 0", encoding.LeafLevel, 0, true},
+		{"leaf accepts level 1", encoding.LeafLevel, 1, true},
+		{"leaf accepts level 2", encoding.LeafLevel, 2, true},
+		{"leaf accepts level 10", encoding.LeafLevel, 10, true},
+		{"level 1 accepts leaf", 1, encoding.LeafLevel, true},
+		{"level 1 accepts level 1", 1, 1, true},
+		{"level 1 accepts level 2", 1, 2, true},
+		{"level 1 rejects level 3", 1, 3, false},
+		{"level 2 accepts level 1", 2, 1, true},
+		{"level 2 rejects level 0 non-leaf", 2, 0, true}, // level 0 == LeafLevel, accepted
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fsm, _, _ := newTestFSM(1, tt.localLevel)
+			if got := fsm.levelAcceptable(tt.remoteLevel); got != tt.want {
+				t.Errorf("levelAcceptable(%d) = %v, want %v (local level %d)",
+					tt.remoteLevel, got, tt.want, tt.localLevel)
+			}
+		})
 	}
 }

@@ -426,6 +426,43 @@ func (fe *FloodEngine) generateAndSendTIDEs() {
 	}
 }
 
+// buildTIDEChunks splits sorted headers into contiguous TIDE packets.
+// The first chunk starts at MinTIEID, the last ends at MaxTIEID, and
+// interior boundaries tile without gaps (RFC 9692 Section 4.2.3.3).
+func buildTIDEChunks(headers []encoding.TIEHeaderWithLifeTime) []encoding.TIDEPacket {
+	if len(headers) == 0 {
+		return []encoding.TIDEPacket{{
+			StartRange: MinTIEID,
+			EndRange:   MaxTIEID,
+		}}
+	}
+
+	var chunks []encoding.TIDEPacket
+	for start := 0; start < len(headers); start += MaxTIDEHeaders {
+		end := start + MaxTIDEHeaders
+		if end > len(headers) {
+			end = len(headers)
+		}
+
+		startRange := MinTIEID
+		if len(chunks) > 0 {
+			startRange = chunks[len(chunks)-1].EndRange
+		}
+
+		endRange := headers[end-1].Header.TIEID
+		if end == len(headers) {
+			endRange = MaxTIEID
+		}
+
+		chunks = append(chunks, encoding.TIDEPacket{
+			StartRange: startRange,
+			EndRange:   endRange,
+			Headers:    headers[start:end],
+		})
+	}
+	return chunks
+}
+
 // sendTIDEsToAdj generates and sends TIDE packets for one adjacency.
 func (fe *FloodEngine) sendTIDEsToAdj(adj *adjFloodState) {
 	// Collect scope-filtered headers.
@@ -437,36 +474,8 @@ func (fe *FloodEngine) sendTIDEsToAdj(adj *adjFloodState) {
 		return true
 	})
 
-	// Split into TIDE packets.
-	for i := 0; i <= len(headers)/MaxTIDEHeaders; i++ {
-		start := i * MaxTIDEHeaders
-		end := start + MaxTIDEHeaders
-		if end > len(headers) {
-			end = len(headers)
-		}
-
-		chunk := headers[start:end]
-
-		startRange := MinTIEID
-		endRange := MaxTIEID
-		if len(chunk) > 0 {
-			startRange = chunk[0].Header.TIEID
-			endRange = chunk[len(chunk)-1].Header.TIEID
-		}
-		// First TIDE starts at MinTIEID, last ends at MaxTIEID.
-		if i == 0 {
-			startRange = MinTIEID
-		}
-		if end >= len(headers) {
-			endRange = MaxTIEID
-		}
-
-		tide := &encoding.TIDEPacket{
-			StartRange: startRange,
-			EndRange:   endRange,
-			Headers:    chunk,
-		}
-
+	for _, tide := range buildTIDEChunks(headers) {
+		tideCopy := tide
 		pkt := &encoding.ProtocolPacket{
 			Header: encoding.PacketHeader{
 				MajorVersion: encoding.ProtocolMajorVersion,
@@ -475,10 +484,9 @@ func (fe *FloodEngine) sendTIDEsToAdj(adj *adjFloodState) {
 				Level:        &fe.level,
 			},
 			Content: encoding.PacketContent{
-				TIDE: tide,
+				TIDE: &tideCopy,
 			},
 		}
-
 		fe.sendFloodPacket(adj, pkt, 0)
 	}
 }

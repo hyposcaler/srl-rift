@@ -4,9 +4,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"sort"
 )
+
+// maxRIFTCollectionSize is a sanity cap on decoded collection lengths
+// to prevent OOM from malicious or corrupt packets.
+const maxRIFTCollectionSize int32 = 10000
 
 // Thrift binary protocol type IDs.
 const (
@@ -1092,6 +1095,19 @@ func (d *Decoder) readI32() (int32, error) {
 	return int32(binary.BigEndian.Uint32(d.buf[:4])), err
 }
 
+// readCollectionLen reads a Thrift i32 and validates it as a collection
+// length: must be non-negative and at most max.
+func (d *Decoder) readCollectionLen(max int32) (int32, error) {
+	n, err := d.readI32()
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 || n > max {
+		return 0, fmt.Errorf("collection length %d out of bounds [0, %d]", n, max)
+	}
+	return n, nil
+}
+
 func (d *Decoder) readI64() (int64, error) {
 	_, err := io.ReadFull(d.r, d.buf[:8])
 	return int64(binary.BigEndian.Uint64(d.buf[:8])), err
@@ -1614,7 +1630,7 @@ func (d *Decoder) decodeTIDEPacket(p *TIDEPacket) error {
 			if err != nil {
 				return err
 			}
-			n, err := d.readI32()
+			n, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -1649,7 +1665,7 @@ func (d *Decoder) decodeTIREPacket(p *TIREPacket) error {
 			if err != nil {
 				return err
 			}
-			n, err := d.readI32()
+			n, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -1756,7 +1772,7 @@ func (d *Decoder) decodeNodeTIEElement(n *NodeTIEElement) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -1794,7 +1810,7 @@ func (d *Decoder) decodeNodeTIEElement(n *NodeTIEElement) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -1812,7 +1828,7 @@ func (d *Decoder) decodeNodeTIEElement(n *NodeTIEElement) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -1863,7 +1879,7 @@ func (d *Decoder) decodeNodeNeighborsTIEElement(n *NodeNeighborsTIEElement) erro
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -1946,7 +1962,7 @@ func (d *Decoder) decodeLinkIDPair(p *LinkIDPair) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -2062,7 +2078,7 @@ func (d *Decoder) decodePrefixTIEElement(p *PrefixTIEElement) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -2103,7 +2119,7 @@ func (d *Decoder) decodePrefixAttributes(a *PrefixAttributes) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -2191,7 +2207,7 @@ func (d *Decoder) decodeKeyValueTIEElement(kv *KeyValueTIEElement) error {
 			if err != nil {
 				return err
 			}
-			count, err := d.readI32()
+			count, err := d.readCollectionLen(maxRIFTCollectionSize)
 			if err != nil {
 				return err
 			}
@@ -2241,7 +2257,3 @@ func (d *Decoder) decodeKeyValueTIEElementContent(c *KeyValueTIEElementContent) 
 		}
 	}
 }
-
-// Helper to suppress unused import warnings.
-var _ = math.MaxInt32
-var _ = sort.Slice

@@ -12,8 +12,9 @@ type AdjacencyInfo struct {
 	NeighborID    encoding.SystemIDType
 	NeighborLevel encoding.LevelType
 	NeighborAddr  netip.Addr
-	FloodPort     encoding.UDPPortType
-	LocalLinkID   encoding.LinkIDType
+	FloodPort       encoding.UDPPortType
+	LocalLinkID     encoding.LinkIDType
+	NeighborLinkID  encoding.LinkIDType
 }
 
 // AdjacencyChange signals an adjacency state change to the flood engine.

@@ -53,7 +53,7 @@ func (fe *FloodEngine) originateNorthNodeTIE() (encoding.TIEID, bool) {
 				LinkIDs: []encoding.LinkIDPair{
 					{
 						LocalID:  adj.Info.LocalLinkID,
-						RemoteID: encoding.LinkIDType(adj.Info.NeighborID), // best available
+						RemoteID: adj.Info.NeighborLinkID,
 					},
 				},
 			}
@@ -133,7 +133,7 @@ func (fe *FloodEngine) originateSouthNodeTIE() (encoding.TIEID, bool) {
 				LinkIDs: []encoding.LinkIDPair{
 					{
 						LocalID:  adj.Info.LocalLinkID,
-						RemoteID: encoding.LinkIDType(adj.Info.NeighborID),
+						RemoteID: adj.Info.NeighborLinkID,
 					},
 				},
 			}
