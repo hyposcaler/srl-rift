@@ -123,32 +123,34 @@ bash lab/scripts/deploy.sh --build
 bash lab/scripts/verify.sh
 
 # 5. Check adjacencies on a leaf
-docker exec clab-rift-leaf1 sr_cli -- "info from state rift interface"
+docker exec clab-rift-leaf1 sr_cli "info from state rift interface *"
 
-# 6. Check routes on a leaf (default route via both spines)
-docker exec clab-rift-leaf1 sr_cli -- "show network-instance default route-table ipv4-unicast route"
+# 6. Check RIFT routes on a leaf (default route via both spines)
+docker exec clab-rift-leaf1 sr_cli "info from state rift rib-summary"
 
 # 7. Ping between hosts
 docker exec clab-rift-host1 ping -c 3 10.10.2.10
 docker exec clab-rift-host1 ping -c 3 10.10.3.10
 
 # 8. Test disaggregation: disable spine1-leaf3 link
-docker exec clab-rift-spine1 sr_cli -- \
-  "enter candidate" \
-  "set interface ethernet-1/3 admin-state disable" \
-  "commit now"
+docker exec -i clab-rift-spine1 sr_cli <<SREOF
+enter candidate
+set interface ethernet-1/3 admin-state disable
+commit now
+SREOF
 
 # Wait ~10s, then verify leaf3 is still reachable via spine2
 docker exec clab-rift-host1 ping -c 3 10.10.3.10
 
 # Check disaggregation state on spine2
-docker exec clab-rift-spine2 sr_cli -- "info from state rift disaggregation-summary"
+docker exec clab-rift-spine2 sr_cli "info from state rift disaggregation-summary"
 
 # 9. Restore the link
-docker exec clab-rift-spine1 sr_cli -- \
-  "enter candidate" \
-  "set interface ethernet-1/3 admin-state enable" \
-  "commit now"
+docker exec -i clab-rift-spine1 sr_cli <<SREOF
+enter candidate
+set interface ethernet-1/3 admin-state enable
+commit now
+SREOF
 
 # 10. Tear down
 sudo containerlab destroy -t lab/topology.clab.yml
