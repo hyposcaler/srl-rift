@@ -3,6 +3,7 @@
 ## Current Status
 **Active milestone:** None (all milestones complete)
 **Last completed:** M6 (Polish)
+**Next available:** C1 (Correctness fixes) - see PLAN.md section 7a
 **Blockers:** None
 
 ## Overview

@@ -17,7 +17,7 @@ milestone listed. Just continue from where it left off.
 - Deploy to lab: `bash lab/scripts/deploy.sh --build`
 
 ## git rules
-- before starting work on a new milestone, make sure to create a commit for the previous milestone.
+- before starting work on a new milestone/correction, make sure to create a commit for the previous milestone/correction.
 
 ## Code Conventions
 - No em-dashes. Use commas, parentheses, or separate sentences.
