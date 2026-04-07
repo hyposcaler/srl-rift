@@ -6,8 +6,8 @@ module rift-srl {
   description
     "YANG module for the RIFT protocol NDK agent (RFC 9692)";
 
-  revision "2025-04-06" {
-    description "M0: initial scaffolding";
+  revision "2026-04-06" {
+    description "M1: LIE exchange and adjacency formation";
   }
 
   container rift {
@@ -60,6 +60,41 @@ module rift-srl {
       leaf name {
         description "SR Linux interface name (e.g., ethernet-1/1)";
         type string;
+      }
+
+      container adjacency {
+        description "LIE adjacency state for this interface";
+        config false;
+
+        leaf state {
+          description "Adjacency FSM state";
+          type enumeration {
+            enum one-way {
+              description "No valid LIE received from neighbor";
+            }
+            enum two-way {
+              description "Valid LIE received, no reflection yet";
+            }
+            enum three-way {
+              description "Full adjacency established";
+            }
+          }
+        }
+
+        leaf neighbor-system-id {
+          description "Neighbor system identifier";
+          type uint64;
+        }
+
+        leaf neighbor-level {
+          description "Neighbor level in the fabric";
+          type uint8;
+        }
+
+        leaf neighbor-address {
+          description "Neighbor IPv4 address";
+          type string;
+        }
       }
     }
   }

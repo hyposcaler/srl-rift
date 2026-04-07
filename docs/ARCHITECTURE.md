@@ -1,8 +1,8 @@
 # ARCHITECTURE.md
 
 ## Current Status
-**Active milestone:** M1 (LIE)
-**Last completed:** M0 (Scaffolding)
+**Active milestone:** M2 (TIE Flooding)
+**Last completed:** M1 (LIE)
 **Blockers:** None
 
 ## Overview
@@ -235,7 +235,54 @@ restart. See `lab/scripts/deploy.sh`.
 - SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M1: LIE
-<!-- filled in after M1 gate passes -->
+
+### Decisions Log
+
+#### M1: Agent Runs in srbase Namespace
+**Choice:** Agent process runs in `srbase` namespace, not `srbase-default`
+**Why:** SR Linux app manager launches agents in the `srbase` namespace.
+The M0 architecture document assumed `srbase-default`, but testing confirmed
+the actual namespace is `srbase`. All socket operations and interface address
+discovery explicitly switch namespaces as needed:
+- Multicast recv socket: created in `srbase` (current ns, no switch needed)
+- Multicast send socket: created in `srbase-default` via `unix.Setns()`
+- Interface address discovery: performed in `srbase-default` via `unix.Setns()`
+- Subinterface index lookup: performed in `srbase-default` via `unix.Setns()`
+
+#### M1: NDK Config Delivery Model
+**Choice:** Accumulate config across multiple notifications per commit batch
+**Why:** NDK delivers RIFT config as multiple separate notifications:
+1. `.rift` path with JSON: `{"admin-state":"enable","system-id":"1","level":1}`
+2. `.rift.interface{.name=="ethernet-1/X"}` per interface (empty data, name in path)
+3. `.commit.end` signals end of batch
+
+Field names use YANG hyphenated naming (`admin-state`, `system-id`).
+`system-id` is delivered as a JSON string, not a number.
+Interface names are extracted from `JsPathWithKeys` or `Keys` fields.
+
+#### M1: NDK Server Must Be Explicitly Enabled
+**Choice:** Add `set / system ndk-server admin-state enable` to startup configs
+**Why:** SR Linux v26.3.1 does not enable the NDK server by default. Without it,
+the `sr_sdk_service_manager:50053` unix socket does not exist and the agent
+blocks on `grpc.Dial()` with `WithBlock()`. The deploy script now applies this
+config along with RIFT-specific config after the app manager reload.
+
+#### M1: Initial Interface Notifications Have Zeroed Data
+**Choice:** Ignore interface events where admin_up=false, oper_up=false, mtu=0
+**Why:** NDK sends initial interface notifications with all fields zeroed before
+delivering real state. Acting on these would incorrectly stop interfaces that
+were just started. Real admin-down or oper-down events always have non-zero MTU.
+
+### Gate Results
+- All 6 lab adjacencies reach ThreeWay within ~5 seconds of agent start
+- Adjacency state visible via `info from state rift` on all 5 nodes
+- Each adjacency shows: state, neighbor-system-id, neighbor-level, neighbor-address
+- Interface disable (admin-state disable) causes adjacency drop to one-way
+- Interface re-enable causes adjacency recovery to three-way
+- LIE FSM unit tests: 17 tests passing (14 table-driven + 3 focused)
+- Transport unit tests: 4 tests passing (interface name mapping)
+- Existing codec tests: 4 tests passing (unchanged)
+- SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M2: TIE Flooding
 <!-- filled in after M2 gate passes -->
