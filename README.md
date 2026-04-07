@@ -1,4 +1,4 @@
-# rift-srl
+# srl-rift
 
 RIFT (RFC 9692) routing protocol implementation as an SR Linux NDK agent in Go.
 
