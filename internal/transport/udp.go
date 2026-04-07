@@ -646,6 +646,64 @@ func DiscoverInterfaceAddr(ifName string) (netip.Addr, error) {
 	return netip.Addr{}, fmt.Errorf("no IPv4 address on %s", ifName)
 }
 
+// DiscoverAllPrefixes returns all IPv4 prefixes from subinterfaces in
+// srbase-default, excluding the loopback. This discovers host-facing and
+// other non-RIFT interfaces in the default network instance.
+func DiscoverAllPrefixes() (map[string]netip.Prefix, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNS, err := unix.Open("/proc/self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open current netns: %w", err)
+	}
+	defer unix.Close(origNS)
+
+	defaultNS, err := unix.Open("/var/run/netns/srbase-default", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open srbase-default netns: %w", err)
+	}
+	defer unix.Close(defaultNS)
+
+	if err := unix.Setns(defaultNS, unix.CLONE_NEWNET); err != nil {
+		return nil, fmt.Errorf("setns srbase-default: %w", err)
+	}
+	defer func() {
+		_ = unix.Setns(origNS, unix.CLONE_NEWNET)
+	}()
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("list interfaces: %w", err)
+	}
+
+	result := make(map[string]netip.Prefix)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		// Skip SR Linux internal interfaces.
+		if iface.Name == "gateway" || iface.Name == "mgmt0.0" {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			prefix, err := netip.ParsePrefix(a.String())
+			if err != nil {
+				continue
+			}
+			if prefix.Addr().Is4() && !prefix.Addr().IsLoopback() {
+				result[iface.Name] = prefix
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
 // encodePacket serializes a ProtocolPacket into a security envelope.
 func encodePacket(pkt *encoding.ProtocolPacket) ([]byte, error) {
 	var payload bytes.Buffer

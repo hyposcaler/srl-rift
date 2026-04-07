@@ -3,6 +3,7 @@ package tie
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/hyposcaler/srl-rift/internal/encoding"
@@ -51,6 +52,7 @@ type FloodEngine struct {
 
 	// Per-adjacency flood state, keyed by interface name.
 	adjacencies map[string]*adjFloodState
+	adjMu       sync.RWMutex // protects adjacencies for external reads
 
 	// Locally attached prefixes for TIE origination.
 	localPrefixes []LocalPrefix
@@ -59,6 +61,7 @@ type FloodEngine struct {
 	AdjChangeCh  chan AdjacencyChange  // from agent
 	FloodRecvCh  chan ReceivedFloodPkt // from transport
 	FloodSendCh  chan FloodPacket      // to transport
+	LSDBChangeCh chan struct{}          // notifies SPF of LSDB mutations
 
 	logger *slog.Logger
 }
@@ -88,6 +91,7 @@ func NewFloodEngine(
 		AdjChangeCh:   make(chan AdjacencyChange, 16),
 		FloodRecvCh:   make(chan ReceivedFloodPkt, 64),
 		FloodSendCh:   make(chan FloodPacket, 256),
+		LSDBChangeCh:  make(chan struct{}, 1),
 		logger:        logger,
 	}
 }
@@ -101,6 +105,26 @@ func (fe *FloodEngine) LSDB() *LSDB {
 // prefix TIEs.
 func (fe *FloodEngine) UpdateLocalPrefixes(prefixes []LocalPrefix) {
 	fe.localPrefixes = prefixes
+}
+
+// Adjacencies returns a snapshot of current adjacency info.
+// Safe to call from any goroutine.
+func (fe *FloodEngine) Adjacencies() map[string]AdjacencyInfo {
+	fe.adjMu.RLock()
+	defer fe.adjMu.RUnlock()
+	result := make(map[string]AdjacencyInfo, len(fe.adjacencies))
+	for k, v := range fe.adjacencies {
+		result[k] = v.Info
+	}
+	return result
+}
+
+// notifyLSDBChange sends a non-blocking notification that the LSDB changed.
+func (fe *FloodEngine) notifyLSDBChange() {
+	select {
+	case fe.LSDBChangeCh <- struct{}{}:
+	default:
+	}
 }
 
 // Run is the main flood engine loop. It processes adjacency changes,
@@ -141,6 +165,7 @@ func (fe *FloodEngine) Run(ctx context.Context) error {
 
 // handleAdjChange processes an adjacency up/down event.
 func (fe *FloodEngine) handleAdjChange(change AdjacencyChange) {
+	fe.adjMu.Lock()
 	if change.Info != nil {
 		// Adjacency up: add flood state, re-originate TIEs.
 		fe.logger.Info("flood adjacency up",
@@ -154,12 +179,14 @@ func (fe *FloodEngine) handleAdjChange(change AdjacencyChange) {
 		fe.logger.Info("flood adjacency down", "interface", change.InterfaceName)
 		delete(fe.adjacencies, change.InterfaceName)
 	}
+	fe.adjMu.Unlock()
 
 	// Re-originate self TIEs (adjacency list changed).
 	changed := fe.originateSelfTIEs()
 	for _, id := range changed {
 		fe.floodTIEToAll(id)
 	}
+	fe.notifyLSDBChange()
 }
 
 // handleFloodPacket dispatches an incoming packet to the correct handler.
@@ -218,6 +245,7 @@ func (fe *FloodEngine) handleTIE(ifName string, pkt *encoding.ProtocolPacket) {
 		})
 		fe.ackTIE(adj, id)
 		fe.floodTIEToAllExcept(id, ifName)
+		fe.notifyLSDBChange()
 		fe.logger.Info("TIE received and installed",
 			"id", id,
 			"seq", tie.Header.SeqNr,
@@ -244,6 +272,7 @@ func (fe *FloodEngine) handleTIE(ifName string, pkt *encoding.ProtocolPacket) {
 		})
 		fe.ackTIE(adj, id)
 		fe.floodTIEToAllExcept(id, ifName)
+		fe.notifyLSDBChange()
 		fe.logger.Info("TIE updated",
 			"id", id,
 			"seq", tie.Header.SeqNr,
@@ -446,6 +475,9 @@ func (fe *FloodEngine) tickLifetimes() {
 	for _, id := range expired {
 		fe.lsdb.Remove(id)
 		fe.logger.Info("TIE expired", "id", id)
+	}
+	if len(expired) > 0 {
+		fe.notifyLSDBChange()
 	}
 
 	// Re-originate own TIEs approaching expiry.

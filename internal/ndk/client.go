@@ -26,6 +26,8 @@ type Client struct {
 	sdkMgr    ndkgo.SdkMgrServiceClient
 	notifSvc  ndkgo.SdkNotificationServiceClient
 	telemetry ndkgo.SdkMgrTelemetryServiceClient
+	routeSvc  ndkgo.SdkMgrRouteServiceClient
+	nhgSvc    ndkgo.SdkMgrNextHopGroupServiceClient
 	md        metadata.MD
 	streamID  uint64
 	appID     uint32
@@ -48,6 +50,8 @@ func New(ctx context.Context, logger *slog.Logger) (*Client, error) {
 		sdkMgr:    ndkgo.NewSdkMgrServiceClient(conn),
 		notifSvc:  ndkgo.NewSdkNotificationServiceClient(conn),
 		telemetry: ndkgo.NewSdkMgrTelemetryServiceClient(conn),
+		routeSvc:  ndkgo.NewSdkMgrRouteServiceClient(conn),
+		nhgSvc:    ndkgo.NewSdkMgrNextHopGroupServiceClient(conn),
 		md:        metadata.Pairs("agent_name", agentName),
 		logger:    logger,
 	}

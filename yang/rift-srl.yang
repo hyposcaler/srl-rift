@@ -99,7 +99,13 @@ module rift-srl {
     }
 
     leaf lsdb-summary {
-      description "JSON summary of the link-state database (TIE entries)";
+      description "Summary of the link-state database (TIE entries)";
+      config false;
+      type string;
+    }
+
+    leaf rib-summary {
+      description "Summary of routes computed by SPF";
       config false;
       type string;
     }

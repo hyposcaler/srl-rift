@@ -47,7 +47,10 @@ for node in "${NODES[@]}"; do
     # Allow unprivileged port binding in srbase-default (for RIFT TIE port 915).
     docker exec "$container" ip netns exec srbase-default sysctl -w net.ipv4.ip_unprivileged_port_start=0 || true
 
-    # Reload app manager to pick up new agent.
+    # Restart the agent if it is already running (picks up new binary).
+    docker exec "$container" sr_cli -- "tools system app-management application rift-srl restart" 2>/dev/null || true
+
+    # Reload app manager to pick up new agent (first deploy).
     docker exec "$container" sr_cli -- tools system app-management application app_mgr reload || true
 
     echo "  Deployed to $container"

@@ -118,6 +118,18 @@ func (db *LSDB) HeadersSorted() []encoding.TIEHeaderWithLifeTime {
 	return headers
 }
 
+// Snapshot returns a consistent copy of all LSDB entries under a single
+// read lock. Used by SPF for point-in-time computation.
+func (db *LSDB) Snapshot() map[encoding.TIEID]*LSDBEntry {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	result := make(map[encoding.TIEID]*LSDBEntry, len(db.entries))
+	for id, entry := range db.entries {
+		result[id] = entry
+	}
+	return result
+}
+
 // DecrementLifetimes decreases remaining_lifetime by delta seconds for all
 // entries. Returns the TIEIDs of entries that have expired (lifetime <= 0).
 func (db *LSDB) DecrementLifetimes(delta int32) []encoding.TIEID {

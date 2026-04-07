@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/hyposcaler/srl-rift/internal/encoding"
 	"github.com/hyposcaler/srl-rift/internal/lie"
 	"github.com/hyposcaler/srl-rift/internal/ndk"
+	"github.com/hyposcaler/srl-rift/internal/spf"
 	"github.com/hyposcaler/srl-rift/internal/tie"
 	"github.com/hyposcaler/srl-rift/internal/transport"
 )
@@ -33,7 +36,22 @@ type Agent struct {
 	floodEngine *tie.FloodEngine
 	floodRecvCh chan transport.ReceivedPacket // shared by all flood recv loops
 
+	// SPF engine for route computation.
+	spfEngine *spf.Engine
+
+	// Tracks routes currently programmed in FIB via NDK.
+	programmedRIB map[string]programmedRoute
+
 	mu sync.Mutex
+}
+
+const networkInstance = "default"
+
+// programmedRoute tracks a route installed in the FIB.
+type programmedRoute struct {
+	nhgName string
+	metric  uint32
+	nhAddrs []netip.Addr
 }
 
 type interfaceState struct {
@@ -119,6 +137,15 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Create SPF engine.
+	a.spfEngine = spf.NewEngine(
+		a.cfg.SystemID,
+		a.cfg.Level,
+		a.floodEngine.LSDB(),
+		a.floodEngine.Adjacencies,
+		a.logger,
+	)
+
 	// Flood send loop: reads from flood engine, dispatches to transport.
 	go a.floodSendLoop(ctx)
 
@@ -134,6 +161,9 @@ func (a *Agent) Run(ctx context.Context) error {
 
 // Close cleans up agent resources.
 func (a *Agent) Close() {
+	// Withdraw routes before tearing down interfaces.
+	a.withdrawAllRoutes(context.Background())
+
 	a.mu.Lock()
 	for name := range a.interfaces {
 		a.stopInterfaceLocked(name)
@@ -302,9 +332,16 @@ func (a *Agent) eventLoop(ctx context.Context) error {
 	lsdbTicker := time.NewTicker(5 * time.Second)
 	defer lsdbTicker.Stop()
 
+	// SPF debounce timer: fires 100ms after last LSDB change.
+	var spfTimer *time.Timer
+	var spfTimerC <-chan time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
+			if spfTimer != nil {
+				spfTimer.Stop()
+			}
 			return nil
 
 		case ev := <-a.notifHandler.InterfaceCh:
@@ -315,6 +352,19 @@ func (a *Agent) eventLoop(ctx context.Context) error {
 
 		case ev := <-a.adjEventCh:
 			a.handleAdjacencyEvent(ctx, ev)
+
+		case <-a.floodEngine.LSDBChangeCh:
+			if spfTimer == nil {
+				spfTimer = time.NewTimer(100 * time.Millisecond)
+				spfTimerC = spfTimer.C
+			} else {
+				spfTimer.Reset(100 * time.Millisecond)
+			}
+
+		case <-spfTimerC:
+			a.spfEngine.Run()
+			a.syncRoutes(ctx, a.spfEngine.RIB())
+			a.updateRIBTelemetry(ctx)
 
 		case <-lsdbTicker.C:
 			a.updateLSDBTelemetry(ctx)
@@ -459,6 +509,145 @@ func (a *Agent) handleAdjacencyEvent(ctx context.Context, ev lie.AdjacencyEvent)
 	}
 }
 
+// nhgName returns a deterministic NHG name for a prefix, e.g. "rift_10.0.1.1_32_sdk".
+// NDK requires NHG names to end with "_sdk" suffix.
+func nhgName(prefix string) string {
+	s := strings.ReplaceAll(prefix, "/", "_")
+	return "rift_" + s + "_sdk"
+}
+
+// nhAddrsEqual returns true if two sorted next-hop address slices are equal.
+func nhAddrsEqual(a, b []netip.Addr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// syncRoutes pushes the full RIB to NDK using SyncStart/SyncEnd. SyncEnd
+// automatically removes any routes not added during the sync window, so
+// we must push ALL current routes every time (not just deltas). NHGs are
+// only created/updated when their next-hops actually changed.
+func (a *Agent) syncRoutes(ctx context.Context, newRIB spf.RIB) {
+	if a.programmedRIB == nil {
+		a.programmedRIB = make(map[string]programmedRoute)
+	}
+
+	// Build the full set of routes and identify NHGs that need updating.
+	var allRoutes []ndk.RouteEntry
+	type nhgUpdate struct {
+		name  string
+		addrs []netip.Addr
+	}
+	var nhgsToUpdate []nhgUpdate
+	newProgrammed := make(map[string]programmedRoute)
+
+	for prefix, route := range newRIB {
+		if len(route.NextHops) == 0 {
+			continue
+		}
+		name := nhgName(prefix)
+		metric := uint32(route.Metric)
+
+		addrs := make([]netip.Addr, 0, len(route.NextHops))
+		for _, nh := range route.NextHops {
+			addrs = append(addrs, nh.Address)
+		}
+
+		allRoutes = append(allRoutes, ndk.RouteEntry{
+			Prefix:  prefix,
+			NHGName: name,
+			Metric:  metric,
+		})
+
+		newProgrammed[prefix] = programmedRoute{
+			nhgName: name,
+			metric:  metric,
+			nhAddrs: addrs,
+		}
+
+		// Only update NHG if next-hops changed.
+		prev, exists := a.programmedRIB[prefix]
+		if !exists || !nhAddrsEqual(prev.nhAddrs, addrs) {
+			nhgsToUpdate = append(nhgsToUpdate, nhgUpdate{name: name, addrs: addrs})
+		}
+	}
+
+	if len(allRoutes) == 0 && len(a.programmedRIB) == 0 {
+		return
+	}
+
+	// Identify stale NHGs to clean up after SyncEnd removes their routes.
+	var staleNHGs []string
+	for prefix := range a.programmedRIB {
+		if _, exists := newProgrammed[prefix]; !exists {
+			staleNHGs = append(staleNHGs, nhgName(prefix))
+		}
+	}
+
+	a.logger.Info("syncing routes to FIB",
+		"total", len(allRoutes),
+		"nhg_updates", len(nhgsToUpdate),
+		"stale_nhgs", len(staleNHGs),
+	)
+
+	// Create/update NHGs before routes reference them.
+	for _, nhg := range nhgsToUpdate {
+		if err := a.ndk.AddOrUpdateNextHopGroup(ctx, nhg.name, networkInstance, nhg.addrs); err != nil {
+			a.logger.Error("nhg add failed", "name", nhg.name, "error", err)
+		}
+	}
+
+	// SyncStart, push ALL routes, SyncEnd.
+	if err := a.ndk.RouteSyncStart(ctx); err != nil {
+		a.logger.Error("route sync start failed", "error", err)
+		return
+	}
+	if err := a.ndk.AddOrUpdateRoutes(ctx, networkInstance, allRoutes); err != nil {
+		a.logger.Error("route add failed", "error", err)
+	}
+	if err := a.ndk.RouteSyncEnd(ctx); err != nil {
+		a.logger.Error("route sync end failed", "error", err)
+	}
+
+	// Clean up NHGs for removed routes (after SyncEnd removed the routes).
+	if err := a.ndk.DeleteNextHopGroups(ctx, networkInstance, staleNHGs); err != nil {
+		a.logger.Error("nhg delete failed", "error", err)
+	}
+
+	a.programmedRIB = newProgrammed
+}
+
+// withdrawAllRoutes removes all programmed routes from the FIB.
+func (a *Agent) withdrawAllRoutes(ctx context.Context) {
+	if len(a.programmedRIB) == 0 {
+		return
+	}
+
+	var prefixes []string
+	var nhgNames []string
+	for prefix := range a.programmedRIB {
+		prefixes = append(prefixes, prefix)
+		nhgNames = append(nhgNames, nhgName(prefix))
+	}
+
+	a.logger.Info("withdrawing all routes", "count", len(prefixes))
+
+	if err := a.ndk.DeleteRoutes(ctx, networkInstance, prefixes); err != nil {
+		a.logger.Error("withdraw routes failed", "error", err)
+	}
+	if err := a.ndk.DeleteNextHopGroups(ctx, networkInstance, nhgNames); err != nil {
+		a.logger.Error("withdraw nhgs failed", "error", err)
+	}
+
+	a.programmedRIB = make(map[string]programmedRoute)
+}
+
 // interfaceTelemetry is the JSON structure for the interface list entry.
 type interfaceTelemetry struct {
 	Adjacency *adjacencyTelemetry `json:"adjacency,omitempty"`
@@ -585,30 +774,32 @@ func (a *Agent) floodRecvRelay(ctx context.Context) {
 	}
 }
 
-// discoverLocalPrefixes discovers loopback and link prefixes for TIE
-// origination. Reads system0 and configured interface addresses from Linux.
+// discoverLocalPrefixes discovers all locally attached prefixes for TIE
+// origination: loopback, RIFT link prefixes, and host-facing subnets.
 func (a *Agent) discoverLocalPrefixes() []tie.LocalPrefix {
 	var prefixes []tie.LocalPrefix
 
-	// Discover system0 (loopback) address.
-	loopAddr, err := transport.DiscoverInterfaceAddr("system0.0")
-	if err != nil {
-		a.logger.Warn("no loopback address found", "error", err)
-	} else {
-		prefixes = append(prefixes, tie.LocalPrefix{
-			Prefix:   tie.IPv4ToPrefix(loopAddr, 32),
-			Loopback: true,
-			Metric:   1,
-		})
-		a.logger.Info("loopback prefix", "addr", loopAddr)
-	}
-
-	// Discover link addresses from configured interfaces.
+	// Build set of RIFT interface Linux names for dedup.
+	riftSubs := make(map[string]struct{})
 	for ifName := range a.cfg.Interfaces {
 		_, sub := transport.LinuxInterfaceNames(ifName)
-		prefix, err := transport.DiscoverInterfacePrefix(sub)
-		if err != nil {
-			a.logger.Warn("no link address", "interface", ifName, "error", err)
+		riftSubs[sub] = struct{}{}
+	}
+
+	// Discover all IPv4 prefixes in srbase-default.
+	allPrefixes, err := transport.DiscoverAllPrefixes()
+	if err != nil {
+		a.logger.Warn("discover all prefixes failed", "error", err)
+	}
+
+	for ifName, prefix := range allPrefixes {
+		if ifName == "system0.0" {
+			prefixes = append(prefixes, tie.LocalPrefix{
+				Prefix:   tie.IPv4ToPrefix(prefix.Addr(), 32),
+				Loopback: true,
+				Metric:   1,
+			})
+			a.logger.Info("loopback prefix", "addr", prefix.Addr())
 			continue
 		}
 		prefixes = append(prefixes, tie.LocalPrefix{
@@ -616,13 +807,52 @@ func (a *Agent) discoverLocalPrefixes() []tie.LocalPrefix {
 			Loopback: false,
 			Metric:   1,
 		})
+		if _, isRift := riftSubs[ifName]; isRift {
+			a.logger.Info("link prefix", "interface", ifName, "prefix", prefix)
+		} else {
+			a.logger.Info("local prefix", "interface", ifName, "prefix", prefix)
+		}
 	}
 
 	return prefixes
 }
 
-// updateLSDBTelemetry pushes LSDB summary to NDK telemetry.
+// ribSummaryString builds a human-readable RIB summary.
+func (a *Agent) ribSummaryString() string {
+	if a.spfEngine == nil {
+		return ""
+	}
+	rib := a.spfEngine.RIB()
+	if len(rib) == 0 {
+		return ""
+	}
+	var summary string
+	for prefix, route := range rib {
+		if summary != "" {
+			summary += " | "
+		}
+		var nhAddrs []string
+		for _, nh := range route.NextHops {
+			nhAddrs = append(nhAddrs, nh.Address.String())
+		}
+		summary += fmt.Sprintf("%s metric=%d nh=%v", prefix, route.Metric, nhAddrs)
+	}
+	return summary
+}
+
+// updateRIBTelemetry triggers a combined telemetry push after SPF runs.
+func (a *Agent) updateRIBTelemetry(ctx context.Context) {
+	a.updateStateTelemetry(ctx)
+}
+
+// updateLSDBTelemetry triggers a combined telemetry push on LSDB tick.
 func (a *Agent) updateLSDBTelemetry(ctx context.Context) {
+	a.updateStateTelemetry(ctx)
+}
+
+// updateStateTelemetry pushes both LSDB and RIB summaries in a single
+// telemetry update so one does not overwrite the other.
+func (a *Agent) updateStateTelemetry(ctx context.Context) {
 	if a.floodEngine == nil {
 		return
 	}
@@ -654,11 +884,13 @@ func (a *Agent) updateLSDBTelemetry(ctx context.Context) {
 
 	telem := struct {
 		LSDBSummary string `json:"lsdb-summary"`
+		RIBSummary  string `json:"rib-summary,omitempty"`
 	}{
 		LSDBSummary: formatLSDBSummary(ties),
+		RIBSummary:  a.ribSummaryString(),
 	}
 
 	if err := a.ndk.UpdateTelemetry(ctx, ".rift", telem); err != nil {
-		a.logger.Info("LSDB telemetry update failed", "error", err, "ties", len(ties))
+		a.logger.Info("state telemetry update failed", "error", err, "ties", len(ties))
 	}
 }

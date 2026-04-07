@@ -1,8 +1,8 @@
 # ARCHITECTURE.md
 
 ## Current Status
-**Active milestone:** M3 (SPF)
-**Last completed:** M2 (TIE Flooding)
+**Active milestone:** M5 (Disaggregation)
+**Last completed:** M4 (Route Programming)
 **Blockers:** None
 
 ## Overview
@@ -329,10 +329,101 @@ would not normally be flooded to the receiving node.
 - SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M3: SPF
-<!-- filled in after M3 gate passes -->
+
+### Decisions Log
+
+#### M3: No Separate Graph Data Structure
+**Choice:** Run Dijkstra directly on the LSDB snapshot map
+**Why:** The LSDB already indexes TIEs by TIEID (direction, originator, type, nr).
+SPF can look up any node's South Node TIE or North Node TIE with a simple map
+lookup. Building a separate adjacency graph would duplicate information and
+require synchronization. The `Snapshot()` method provides a consistent copy
+under a single read lock.
+
+#### M3: Backlink Verification via Opposite-Direction Node TIEs
+**Choice:** S-SPF checks North Node TIEs for backlinks, N-SPF checks South Node TIEs
+**Why:** RFC 9692 Section 6.4 requires verifying that a neighbor acknowledges the
+link before including it in the SPF tree. For southbound SPF (traversing South
+Node TIEs downward), the backlink is found in the neighbor's North Node TIE.
+For northbound SPF, the backlink is in the spine's South Node TIE. This
+prevents unidirectional links from being used in routing.
+
+#### M3: 100ms LSDB Change Debounce
+**Choice:** SPF runs 100ms after the last LSDB change notification
+**Why:** Multiple TIEs often arrive in rapid succession (adjacency changes trigger
+re-origination of multiple TIEs). Running SPF after each individual TIE would
+waste CPU. The flood engine sends non-blocking notifications on LSDBChangeCh
+whenever a TIE is installed, updated, or expires. The agent event loop resets
+a 100ms timer on each notification, so SPF runs once after the burst settles.
+
+#### M3: Combined State Telemetry Push
+**Choice:** Push `lsdb-summary` and `rib-summary` in a single `TelemetryAddOrUpdate` call
+**Why:** NDK `TelemetryAddOrUpdate` replaces the entire JSON at the given path.
+Pushing LSDB and RIB separately to `.rift` caused whichever ran second to
+overwrite the first. Combining both fields into one struct and pushing once
+ensures both leaves are always populated.
+
+### Gate Results
+- Each leaf computes default route `0.0.0.0/0` via both spines (2 ECMP next-hops, metric 1)
+- Each spine computes routes to all 3 leaf loopbacks (`10.0.1.1/32`, `10.0.1.2/32`, `10.0.1.3/32`, metric 2)
+- Spines also compute routes to leaf link subnets (6 additional /31 routes)
+- S-SPF reports 3 reachable nodes, 9 routes per spine
+- N-SPF reports "no validated northbound neighbors" for spines (correct, no superspines)
+- RIB contents logged with prefix, metric, route type, and next-hop system IDs
+- RIB visible via `info from state rift rib-summary` on all nodes
+- SPF unit tests: 28 tests passing (helpers 22, northbound 8, southbound 10)
+- All existing tests: 71 tests passing (encoding 4, LIE FSM 17, transport 4, TIE 18, SPF 28)
+- SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M4: Route Programming
-<!-- filled in after M4 gate passes -->
+
+### Decisions Log
+
+#### M4: NHG Naming Convention
+**Choice:** NHG names follow `rift_<prefix>_<length>_sdk` pattern (e.g. `rift_0.0.0.0_0_sdk`)
+**Why:** NDK requires next-hop group names to end with `_sdk` or `_SDK` suffix. Using one
+NHG per prefix with a deterministic name is simple, debuggable, and sufficient for this
+scale. The name encodes the prefix so operators can identify what each NHG serves.
+
+#### M4: Full Sync via SyncStart/SyncEnd
+**Choice:** Push ALL routes between SyncStart/SyncEnd on every SPF run
+**Why:** NDK SyncEnd deletes any routes not added during the sync window. An incremental
+approach (only pushing deltas) caused previously-installed routes to be removed by SyncEnd.
+The correct pattern is: SyncStart, push the complete RIB, SyncEnd. SyncEnd automatically
+removes stale routes. NHGs are only created/updated when their next-hops actually change,
+avoiding unnecessary churn.
+
+#### M4: Local Prefix Discovery via Namespace Enumeration
+**Choice:** Auto-discover all IPv4 prefixes in `srbase-default` namespace for North
+Prefix TIE origination, rather than requiring explicit config per host-facing interface
+**Why:** RFC 9692 does not define configuration for non-RIFT interfaces. RIFT only runs
+(LIE/adjacency) on fabric-facing links. Host-facing prefixes are simply locally attached
+routes that a leaf advertises northbound in its North Prefix TIE. The RFC leaves local
+prefix discovery as an implementation detail. Enumerating all IPv4 interfaces in the
+namespace is pragmatic but not ideal: it couples prefix origination to Linux namespace
+state and picks up any interface that happens to exist (internal SR Linux interfaces like
+`gateway` and `mgmt0.0` must be filtered explicitly). A cleaner long-term approach would
+be config-driven (explicit prefix list or passive interface flag), but this works for now.
+**Filtered:** `lo` (loopback flag), `gateway`, `mgmt0.0`, and any 127.x.x.x addresses
+
+#### M4: Deploy Script Agent Restart
+**Choice:** Explicitly restart the rift-srl agent before app_mgr reload
+**Why:** `app_mgr reload` only restarts agents when the YAML or YANG model changes. When
+only the binary is updated, the running agent continues with the old code. Adding an
+explicit `tools system app-management application rift-srl restart` ensures the new binary
+is always loaded on deploy.
+
+### Gate Results
+- Leaf FIBs: default route 0.0.0.0/0 via both spines (2 ECMP next-hops, metric 1, preference 250)
+- Spine FIBs: /32 routes to all 3 leaf loopbacks (10.0.1.1, 10.0.1.2, 10.0.1.3, metric 2)
+- Spine FIBs: 6 additional /31 link subnet routes + 3 host subnet /24 routes
+- Ping between leaf loopbacks: 0% packet loss, TTL=63 (traversing spines)
+- Ping between hosts (host1 10.10.1.10 to host2 10.10.2.10, host3 10.10.3.10): 0% loss, TTL=61
+- Route owner shown as `rift-srl` in SR Linux route table
+- NHGs resolve correctly with `resolved true`
+- Routes automatically update on LSDB changes (SPF debounce + full sync)
+- All existing tests: 71 tests passing (encoding 4, LIE FSM 17, transport 4, TIE 18, SPF 28)
+- SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M5: Disaggregation
 <!-- filled in after M5 gate passes -->
