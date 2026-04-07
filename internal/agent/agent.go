@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/hyposcaler/srl-rift/internal/config"
+	"github.com/hyposcaler/srl-rift/internal/encoding"
 	"github.com/hyposcaler/srl-rift/internal/lie"
 	"github.com/hyposcaler/srl-rift/internal/ndk"
+	"github.com/hyposcaler/srl-rift/internal/tie"
 	"github.com/hyposcaler/srl-rift/internal/transport"
 )
 
@@ -27,13 +29,18 @@ type Agent struct {
 	interfaces map[string]*interfaceState
 	adjEventCh chan lie.AdjacencyEvent
 
+	// Flood engine for TIE origination/flooding.
+	floodEngine *tie.FloodEngine
+	floodRecvCh chan transport.ReceivedPacket // shared by all flood recv loops
+
 	mu sync.Mutex
 }
 
 type interfaceState struct {
-	cancel    context.CancelFunc
-	transport *transport.InterfaceTransport
-	lieIface  *lie.Interface
+	cancel      context.CancelFunc
+	transport   *transport.InterfaceTransport
+	lieIface    *lie.Interface
+	floodCancel context.CancelFunc // for flood recv goroutine, nil if not active
 }
 
 // New creates and registers a new RIFT agent with the NDK.
@@ -87,11 +94,36 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 
-	a.logger.Info("configuration received, starting LIE engine",
+	a.logger.Info("configuration received, starting engines",
 		"system_id", a.cfg.SystemID,
 		"level", a.cfg.Level,
 		"interfaces", len(a.cfg.Interfaces),
 	)
+
+	// Discover local prefixes for TIE origination.
+	localPrefixes := a.discoverLocalPrefixes()
+
+	// Create and start flood engine.
+	a.floodRecvCh = make(chan transport.ReceivedPacket, 128)
+	a.floodEngine = tie.NewFloodEngine(
+		a.cfg.SystemID,
+		a.cfg.Level,
+		fmt.Sprintf("rift-%d", a.cfg.SystemID),
+		localPrefixes,
+		a.logger,
+	)
+
+	go func() {
+		if err := a.floodEngine.Run(ctx); err != nil && ctx.Err() == nil {
+			a.logger.Error("flood engine stopped", "error", err)
+		}
+	}()
+
+	// Flood send loop: reads from flood engine, dispatches to transport.
+	go a.floodSendLoop(ctx)
+
+	// Flood recv relay: reads from shared floodRecvCh, sends to flood engine.
+	go a.floodRecvRelay(ctx)
 
 	// Start interfaces that are configured.
 	a.startConfiguredInterfaces(ctx)
@@ -256,6 +288,9 @@ func (a *Agent) stopInterfaceLocked(name string) {
 	if !ok {
 		return
 	}
+	if iface.floodCancel != nil {
+		iface.floodCancel()
+	}
 	iface.cancel()
 	iface.transport.Close()
 	delete(a.interfaces, name)
@@ -264,6 +299,9 @@ func (a *Agent) stopInterfaceLocked(name string) {
 
 // eventLoop processes interface, config, and adjacency events.
 func (a *Agent) eventLoop(ctx context.Context) error {
+	lsdbTicker := time.NewTicker(5 * time.Second)
+	defer lsdbTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -277,6 +315,9 @@ func (a *Agent) eventLoop(ctx context.Context) error {
 
 		case ev := <-a.adjEventCh:
 			a.handleAdjacencyEvent(ctx, ev)
+
+		case <-lsdbTicker.C:
+			a.updateLSDBTelemetry(ctx)
 		}
 	}
 }
@@ -348,7 +389,8 @@ func (a *Agent) handleConfigChange(ctx context.Context, ev ndk.ConfigEvent) {
 	}
 }
 
-// handleAdjacencyEvent processes FSM state changes and updates telemetry.
+// handleAdjacencyEvent processes FSM state changes, manages flood sockets,
+// and notifies the flood engine.
 func (a *Agent) handleAdjacencyEvent(ctx context.Context, ev lie.AdjacencyEvent) {
 	a.logger.Info("adjacency state change",
 		"interface", ev.InterfaceName,
@@ -356,6 +398,65 @@ func (a *Agent) handleAdjacencyEvent(ctx context.Context, ev lie.AdjacencyEvent)
 	)
 
 	a.updateAdjacencyTelemetry(ctx, ev)
+
+	if a.floodEngine == nil {
+		return
+	}
+
+	a.mu.Lock()
+	iface, ok := a.interfaces[ev.InterfaceName]
+	a.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	if ev.State == lie.ThreeWay && ev.Neighbor != nil {
+		// Open flood socket and start recv loop.
+		if err := iface.transport.OpenFloodSocket(); err != nil {
+			a.logger.Error("open flood socket failed",
+				"interface", ev.InterfaceName,
+				"error", err,
+			)
+			return
+		}
+
+		if iface.floodCancel == nil {
+			floodCtx, floodCancel := context.WithCancel(ctx)
+			iface.floodCancel = floodCancel
+			go func() {
+				if err := iface.transport.FloodRecvLoop(floodCtx, a.floodRecvCh); err != nil && floodCtx.Err() == nil {
+					a.logger.Error("flood recv loop error",
+						"interface", ev.InterfaceName,
+						"error", err,
+					)
+				}
+			}()
+		}
+
+		// Notify flood engine of adjacency up.
+		a.floodEngine.AdjChangeCh <- tie.AdjacencyChange{
+			InterfaceName: ev.InterfaceName,
+			Info: &tie.AdjacencyInfo{
+				InterfaceName: ev.InterfaceName,
+				NeighborID:    ev.Neighbor.SystemID,
+				NeighborLevel: ev.Neighbor.Level,
+				NeighborAddr:  ev.Neighbor.Address,
+				FloodPort:     ev.Neighbor.FloodPort,
+				LocalLinkID:   encoding.LinkIDType(iface.transport.LocalID()),
+			},
+		}
+	} else if ev.State != lie.ThreeWay {
+		// Adjacency dropped. Notify flood engine and close flood socket.
+		a.floodEngine.AdjChangeCh <- tie.AdjacencyChange{
+			InterfaceName: ev.InterfaceName,
+		}
+
+		if iface.floodCancel != nil {
+			iface.floodCancel()
+			iface.floodCancel = nil
+		}
+		iface.transport.CloseFloodSocket()
+	}
 }
 
 // interfaceTelemetry is the JSON structure for the interface list entry.
@@ -396,6 +497,37 @@ func (a *Agent) updateAdjacencyTelemetry(ctx context.Context, ev lie.AdjacencyEv
 	}
 }
 
+type lsdbTIESummary struct {
+	Direction         string
+	Originator        int64
+	TIEType           string
+	TIENr             int32
+	SequenceNumber    int64
+	RemainingLifetime int32
+	SelfOriginated    bool
+}
+
+// formatLSDBSummary creates a human-readable summary of LSDB TIE entries.
+func formatLSDBSummary(ties []lsdbTIESummary) string {
+	if len(ties) == 0 {
+		return "empty"
+	}
+	var s string
+	for i, t := range ties {
+		if i > 0 {
+			s += " | "
+		}
+		origin := ""
+		if t.SelfOriginated {
+			origin = " (self)"
+		}
+		s += fmt.Sprintf("%s-%s:%d#%d-seq%d-lt%d%s",
+			t.Direction, t.TIEType, t.Originator, t.TIENr,
+			t.SequenceNumber, t.RemainingLifetime, origin)
+	}
+	return s
+}
+
 func (a *Agent) keepAlive(ctx context.Context) {
 	ticker := time.NewTicker(a.ndk.KeepaliveInterval())
 	defer ticker.Stop()
@@ -409,5 +541,124 @@ func (a *Agent) keepAlive(ctx context.Context) {
 				a.logger.Error("keepalive failed", "error", err)
 			}
 		}
+	}
+}
+
+// floodSendLoop reads outbound flood packets from the engine and dispatches
+// them to the correct interface transport.
+func (a *Agent) floodSendLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case fp := <-a.floodEngine.FloodSendCh:
+			a.mu.Lock()
+			iface, ok := a.interfaces[fp.InterfaceName]
+			a.mu.Unlock()
+			if !ok {
+				continue
+			}
+			if err := iface.transport.SendFlood(fp.Packet, fp.DestAddr, fp.DestPort, fp.RemainingLifetime); err != nil {
+				a.logger.Debug("flood send error",
+					"interface", fp.InterfaceName,
+					"error", err,
+				)
+			}
+		}
+	}
+}
+
+// floodRecvRelay reads decoded flood packets from the shared channel and
+// forwards them to the flood engine.
+func (a *Agent) floodRecvRelay(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rp := <-a.floodRecvCh:
+			a.floodEngine.FloodRecvCh <- tie.ReceivedFloodPkt{
+				Packet:  rp.Packet,
+				SrcAddr: rp.SrcAddr.String(),
+				IfName:  rp.IfName,
+			}
+		}
+	}
+}
+
+// discoverLocalPrefixes discovers loopback and link prefixes for TIE
+// origination. Reads system0 and configured interface addresses from Linux.
+func (a *Agent) discoverLocalPrefixes() []tie.LocalPrefix {
+	var prefixes []tie.LocalPrefix
+
+	// Discover system0 (loopback) address.
+	loopAddr, err := transport.DiscoverInterfaceAddr("system0.0")
+	if err != nil {
+		a.logger.Warn("no loopback address found", "error", err)
+	} else {
+		prefixes = append(prefixes, tie.LocalPrefix{
+			Prefix:   tie.IPv4ToPrefix(loopAddr, 32),
+			Loopback: true,
+			Metric:   1,
+		})
+		a.logger.Info("loopback prefix", "addr", loopAddr)
+	}
+
+	// Discover link addresses from configured interfaces.
+	for ifName := range a.cfg.Interfaces {
+		_, sub := transport.LinuxInterfaceNames(ifName)
+		prefix, err := transport.DiscoverInterfacePrefix(sub)
+		if err != nil {
+			a.logger.Warn("no link address", "interface", ifName, "error", err)
+			continue
+		}
+		prefixes = append(prefixes, tie.LocalPrefix{
+			Prefix:   tie.IPv4ToPrefix(prefix.Addr(), int8(prefix.Bits())),
+			Loopback: false,
+			Metric:   1,
+		})
+	}
+
+	return prefixes
+}
+
+// updateLSDBTelemetry pushes LSDB summary to NDK telemetry.
+func (a *Agent) updateLSDBTelemetry(ctx context.Context) {
+	if a.floodEngine == nil {
+		return
+	}
+
+	var ties []lsdbTIESummary
+	a.floodEngine.LSDB().ForEachSorted(func(id encoding.TIEID, entry *tie.LSDBEntry) bool {
+		dir := "south"
+		if id.Direction == encoding.TieDirectionNorth {
+			dir = "north"
+		}
+		ttype := "node"
+		switch id.TIEType {
+		case encoding.TIETypePrefixTIEType:
+			ttype = "prefix"
+		case encoding.TIETypePositiveDisaggregationPrefixTIEType:
+			ttype = "positive-disaggregation"
+		}
+		ties = append(ties, lsdbTIESummary{
+			Direction:         dir,
+			Originator:        id.Originator,
+			TIEType:           ttype,
+			TIENr:             id.TIENr,
+			SequenceNumber:    entry.Packet.Header.SeqNr,
+			RemainingLifetime: entry.RemainingLifetime,
+			SelfOriginated:    entry.SelfOriginated,
+		})
+		return true
+	})
+
+	telem := struct {
+		LSDBSummary string `json:"lsdb-summary"`
+	}{
+		LSDBSummary: formatLSDBSummary(ties),
+	}
+
+	if err := a.ndk.UpdateTelemetry(ctx, ".rift", telem); err != nil {
+		a.logger.Info("LSDB telemetry update failed", "error", err, "ties", len(ties))
 	}
 }

@@ -4,6 +4,8 @@ topology:
   kinds:
     srl:
       image: ghcr.io/nokia/srlinux:latest
+    linux:
+      image: ghcr.io/srl-labs/network-multitool
   nodes:
     spine1:
       kind: srl
@@ -25,6 +27,22 @@ topology:
       kind: srl
       type: ixr-d3l
       startup-config: configs/leaf3.cfg
+    host1:
+      kind: linux
+      exec:
+        - ip addr add 10.10.1.10/24 dev eth1
+        - ip route add 10.10.0.0/16 via 10.10.1.1
+    host2:
+      kind: linux
+      exec:
+        - ip addr add 10.10.2.10/24 dev eth1
+        - ip route add 10.10.0.0/16 via 10.10.2.1
+    host3:
+      kind: linux
+      exec:
+        - ip addr add 10.10.3.10/24 dev eth1
+        - ip route add 10.10.0.0/16 via 10.10.3.1
+
 
   links:
     # spine1 to leaves
@@ -35,3 +53,7 @@ topology:
     - endpoints: ["spine2:e1-1", "leaf1:e1-2"]
     - endpoints: ["spine2:e1-2", "leaf2:e1-2"]
     - endpoints: ["spine2:e1-3", "leaf3:e1-2"]
+    # hosts to leaves
+    - endpoints: ["host1:eth1", "leaf1:e1-3"]
+    - endpoints: ["host2:eth1", "leaf2:e1-3"]
+    - endpoints: ["host3:eth1", "leaf3:e1-3"]

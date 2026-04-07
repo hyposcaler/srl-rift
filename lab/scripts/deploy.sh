@@ -44,6 +44,9 @@ for node in "${NODES[@]}"; do
     docker exec "$container" mkdir -p /opt/rift-srl/yang
     docker cp "$REPO_DIR/yang/rift-srl.yang" "$container:/opt/rift-srl/yang/rift-srl.yang"
 
+    # Allow unprivileged port binding in srbase-default (for RIFT TIE port 915).
+    docker exec "$container" ip netns exec srbase-default sysctl -w net.ipv4.ip_unprivileged_port_start=0 || true
+
     # Reload app manager to pick up new agent.
     docker exec "$container" sr_cli -- tools system app-management application app_mgr reload || true
 

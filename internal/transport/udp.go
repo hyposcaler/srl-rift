@@ -1,7 +1,7 @@
-// Package transport manages UDP sockets for RIFT LIE multicast exchange.
-// Each RIFT-enabled interface gets a socket pair: multicast receive (in srbase
-// namespace on the parent interface) and multicast send (in srbase-default on
-// the subinterface).
+// Package transport manages UDP sockets for RIFT protocol exchange.
+// Each RIFT-enabled interface gets a multicast socket pair for LIE exchange
+// (recv in srbase, send in srbase-default) and an optional unicast flood
+// socket for TIE/TIDE/TIRE exchange (in srbase-default on port 915).
 package transport
 
 import (
@@ -23,6 +23,7 @@ import (
 const (
 	riftMcastAddr = "224.0.0.121"
 	riftLIEPort   = 914
+	riftFloodPort = 915
 	recvBufSize   = 9000
 )
 
@@ -42,6 +43,7 @@ type InterfaceTransport struct {
 	linkID    encoding.LinkIDType // ifindex of subinterface
 	recvConn  net.PacketConn      // mcast recv (created in srbase)
 	sendConn  net.PacketConn      // mcast send (srbase-default)
+	floodConn net.PacketConn      // unicast flood (srbase-default, port 915)
 	logger    *slog.Logger
 }
 
@@ -204,7 +206,7 @@ func (t *InterfaceTransport) LocalID() encoding.LinkIDType {
 	return t.linkID
 }
 
-// Close closes both sockets.
+// Close closes all sockets.
 func (t *InterfaceTransport) Close() error {
 	var errs []error
 	if t.recvConn != nil {
@@ -217,8 +219,104 @@ func (t *InterfaceTransport) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if t.floodConn != nil {
+		if err := t.floodConn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if len(errs) > 0 {
 		return fmt.Errorf("close: %v", errs)
+	}
+	return nil
+}
+
+// OpenFloodSocket creates the unicast flood socket (port 915) in
+// srbase-default. Call this when an adjacency reaches ThreeWay.
+func (t *InterfaceTransport) OpenFloodSocket() error {
+	if t.floodConn != nil {
+		return nil // already open
+	}
+	conn, err := createUnicastSocket(t.localAddr, t.sub)
+	if err != nil {
+		return fmt.Errorf("flood socket: %w", err)
+	}
+	t.floodConn = conn
+	t.logger.Info("flood socket opened", "port", riftFloodPort)
+	return nil
+}
+
+// CloseFloodSocket closes the unicast flood socket.
+func (t *InterfaceTransport) CloseFloodSocket() {
+	if t.floodConn != nil {
+		t.floodConn.Close()
+		t.floodConn = nil
+		t.logger.Info("flood socket closed")
+	}
+}
+
+// FloodRecvLoop reads TIE/TIDE/TIRE packets from the unicast flood socket
+// and sends them on out. Blocks until ctx is cancelled.
+func (t *InterfaceTransport) FloodRecvLoop(ctx context.Context, out chan<- ReceivedPacket) error {
+	if t.floodConn == nil {
+		return fmt.Errorf("flood socket not open")
+	}
+	buf := make([]byte, recvBufSize)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		n, addr, err := t.floodConn.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			t.logger.Warn("flood recv error", "error", err)
+			continue
+		}
+
+		srcAddr, err := extractAddr(addr)
+		if err != nil {
+			t.logger.Warn("flood bad source", "addr", addr, "error", err)
+			continue
+		}
+
+		// Skip our own packets.
+		if srcAddr == t.localAddr {
+			continue
+		}
+
+		pkt, err := decodePacket(buf[:n])
+		if err != nil {
+			t.logger.Debug("flood decode error", "error", err, "src", srcAddr)
+			continue
+		}
+
+		select {
+		case out <- ReceivedPacket{Packet: pkt, SrcAddr: srcAddr, IfName: t.ifName}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// SendFlood encodes and sends a ProtocolPacket via unicast to the given
+// destination. remainingLifetime is set in the security envelope.
+func (t *InterfaceTransport) SendFlood(pkt *encoding.ProtocolPacket, destAddr netip.Addr, destPort int, remainingLifetime encoding.LifeTimeInSecType) error {
+	if t.floodConn == nil {
+		return fmt.Errorf("flood socket not open")
+	}
+	data, err := encodeFloodPacket(pkt, remainingLifetime)
+	if err != nil {
+		return fmt.Errorf("encode flood: %w", err)
+	}
+	dst := &net.UDPAddr{
+		IP:   destAddr.AsSlice(),
+		Port: destPort,
+	}
+	_, err = t.floodConn.WriteTo(data, dst)
+	if err != nil {
+		return fmt.Errorf("send flood: %w", err)
 	}
 	return nil
 }
@@ -394,6 +492,114 @@ func createMcastSendSocket(localAddr netip.Addr, subIf string) (net.PacketConn, 
 	return conn, nil
 }
 
+// createUnicastSocket creates a UDP socket in srbase-default bound to
+// localAddr:915 on the given subinterface, for TIE/TIDE/TIRE exchange.
+func createUnicastSocket(localAddr netip.Addr, subIf string) (net.PacketConn, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNS, err := unix.Open("/proc/self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open current netns: %w", err)
+	}
+	defer unix.Close(origNS)
+
+	defaultNS, err := unix.Open("/var/run/netns/srbase-default", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open srbase-default netns: %w", err)
+	}
+	defer unix.Close(defaultNS)
+
+	if err := unix.Setns(defaultNS, unix.CLONE_NEWNET); err != nil {
+		return nil, fmt.Errorf("setns srbase-default: %w", err)
+	}
+	defer func() {
+		_ = unix.Setns(origNS, unix.CLONE_NEWNET)
+	}()
+
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("SO_REUSEADDR: %w", err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("SO_REUSEPORT: %w", err)
+	}
+
+	// Bind to subinterface.
+	if err := unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, subIf); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("SO_BINDTODEVICE %s: %w", subIf, err)
+	}
+
+	// Bind to localAddr:915.
+	addr4 := localAddr.As4()
+	sa := &unix.SockaddrInet4{Port: riftFloodPort, Addr: addr4}
+	if err := unix.Bind(fd, sa); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("bind %s:%d: %w", localAddr, riftFloodPort, err)
+	}
+
+	f := os.NewFile(uintptr(fd), fmt.Sprintf("flood-%s", subIf))
+	conn, err := net.FilePacketConn(f)
+	f.Close()
+	if err != nil {
+		return nil, fmt.Errorf("FilePacketConn: %w", err)
+	}
+
+	return conn, nil
+}
+
+// DiscoverInterfacePrefix gets the IPv4 prefix (address + length) of a
+// Linux subinterface. The subinterface lives in srbase-default.
+func DiscoverInterfacePrefix(ifName string) (netip.Prefix, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origNS, err := unix.Open("/proc/self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("open current netns: %w", err)
+	}
+	defer unix.Close(origNS)
+
+	defaultNS, err := unix.Open("/var/run/netns/srbase-default", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("open srbase-default netns: %w", err)
+	}
+	defer unix.Close(defaultNS)
+
+	if err := unix.Setns(defaultNS, unix.CLONE_NEWNET); err != nil {
+		return netip.Prefix{}, fmt.Errorf("setns srbase-default: %w", err)
+	}
+	defer func() {
+		_ = unix.Setns(origNS, unix.CLONE_NEWNET)
+	}()
+
+	iface, err := net.InterfaceByName(ifName)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("interface %s: %w", ifName, err)
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("addrs %s: %w", ifName, err)
+	}
+	for _, a := range addrs {
+		prefix, err := netip.ParsePrefix(a.String())
+		if err != nil {
+			continue
+		}
+		if prefix.Addr().Is4() {
+			return prefix, nil
+		}
+	}
+	return netip.Prefix{}, fmt.Errorf("no IPv4 prefix on %s", ifName)
+}
+
 // DiscoverInterfaceAddr gets the IPv4 address of a Linux subinterface.
 // The subinterface lives in srbase-default, so we switch namespaces.
 func DiscoverInterfaceAddr(ifName string) (netip.Addr, error) {
@@ -450,6 +656,26 @@ func encodePacket(pkt *encoding.ProtocolPacket) ([]byte, error) {
 
 	env := &encoding.SecurityEnvelope{
 		Payload: payload.Bytes(),
+	}
+	var out bytes.Buffer
+	if err := encoding.EncodeEnvelope(&out, env); err != nil {
+		return nil, fmt.Errorf("encode envelope: %w", err)
+	}
+	return out.Bytes(), nil
+}
+
+// encodeFloodPacket serializes a ProtocolPacket with the given remaining
+// lifetime in the security envelope (used for TIE/TIDE/TIRE).
+func encodeFloodPacket(pkt *encoding.ProtocolPacket, remainingLifetime encoding.LifeTimeInSecType) ([]byte, error) {
+	var payload bytes.Buffer
+	enc := encoding.NewEncoder(&payload)
+	if err := enc.EncodeProtocolPacket(pkt); err != nil {
+		return nil, fmt.Errorf("encode protocol packet: %w", err)
+	}
+
+	env := &encoding.SecurityEnvelope{
+		RemainingLifetime: remainingLifetime,
+		Payload:           payload.Bytes(),
 	}
 	var out bytes.Buffer
 	if err := encoding.EncodeEnvelope(&out, env); err != nil {

@@ -1,8 +1,8 @@
 # ARCHITECTURE.md
 
 ## Current Status
-**Active milestone:** M2 (TIE Flooding)
-**Last completed:** M1 (LIE)
+**Active milestone:** M3 (SPF)
+**Last completed:** M2 (TIE Flooding)
 **Blockers:** None
 
 ## Overview
@@ -285,7 +285,48 @@ were just started. Real admin-down or oper-down events always have non-zero MTU.
 - SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M2: TIE Flooding
-<!-- filled in after M2 gate passes -->
+
+### Decisions Log
+
+#### M2: Unprivileged Port Binding in srbase-default
+**Choice:** Set `net.ipv4.ip_unprivileged_port_start=0` in srbase-default
+**Why:** The agent runs as user `srlinux` (not root). The srbase namespace has
+`ip_unprivileged_port_start=0` (any port allowed), but srbase-default has the
+default value of 1024. TIE flood port 915 requires binding below 1024. The
+deploy script sets the sysctl before starting the agent.
+**Alternatives considered:** Creating the socket in srbase (would not work for
+unicast routing), using CAP_NET_BIND_SERVICE (not available to srlinux user)
+
+#### M2: LSDB Telemetry via Summary Leaf
+**Choice:** Push LSDB as a formatted string to a single `lsdb-summary` leaf
+**Why:** NDK telemetry does not support pushing to YANG list entries with
+composite enumeration keys. A YANG `list tie` with `key "direction originator
+tie-type tie-nr"` could not receive telemetry updates via the NDK
+`TelemetryAddOrUpdate` API. Using a single leaf with a formatted summary string
+provides visibility without YANG complexity.
+**Alternatives considered:** Per-TIE list entries (NDK path format incompatible
+with enum keys)
+
+#### M2: TIE Acceptance Scope Check
+**Choice:** Nodes only accept TIEs they should hold per flooding scope
+**Why:** Without scope filtering on TIE acceptance, TIDE synchronization caused
+incorrect TIE distribution. Spines would include leaf North TIE headers in
+southbound TIDEs (correct per RFC for synchronization), but other leaves would
+then request those TIEs (incorrect, leaves should not hold other leaves' North
+TIEs). Adding `shouldAcceptTIE()` prevents requesting or installing TIEs that
+would not normally be flooded to the receiving node.
+
+### Gate Results
+- Spines hold North Node/Prefix TIEs from all 3 leaves
+- Leaves hold South Node/Prefix TIEs from both spines
+- Self-originated TIEs present on all nodes (Node + Prefix, North + South as appropriate)
+- South Node TIE reflection working (spine2's South Node TIE visible on spine1)
+- Leaves do NOT hold other leaves' North TIEs (scope filtering correct)
+- LSDB visible via `info from state rift` on all nodes
+- TIE sequence numbers increment on adjacency changes
+- LSDB unit tests: 18 tests passing (TIEID ordering, header comparison, LSDB ops, scope rules)
+- All existing tests: 43 tests passing (encoding 4, LIE FSM 17, transport 4, TIE 18)
+- SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M3: SPF
 <!-- filled in after M3 gate passes -->

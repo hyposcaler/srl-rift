@@ -7,7 +7,7 @@ module rift-srl {
     "YANG module for the RIFT protocol NDK agent (RFC 9692)";
 
   revision "2026-04-06" {
-    description "M1: LIE exchange and adjacency formation";
+    description "M2: TIE origination and flooding";
   }
 
   container rift {
@@ -96,6 +96,12 @@ module rift-srl {
           type string;
         }
       }
+    }
+
+    leaf lsdb-summary {
+      description "JSON summary of the link-state database (TIE entries)";
+      config false;
+      type string;
     }
   }
 }
