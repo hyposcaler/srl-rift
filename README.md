@@ -155,6 +155,9 @@ SREOF
 # 10. Tear down
 sudo containerlab destroy -t lab/topology.clab.yml
 ```
+
+Makefile in the repo has a number of targets for each of these steps, see: `make help`
+
 ## Documentation and process notes.
 
 This code was largely generated via Claude Code. The CLAUDE.md includes conventions for the repo. The [docs/PLAN.md](docs/PLAN.md) is the overall plan with milestones that I created through a series of conversations with Claude. The [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) was a doc set aside for Claude to keep track of the work it did over multiple sessions.
