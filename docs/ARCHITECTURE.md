@@ -1,8 +1,8 @@
 # ARCHITECTURE.md
 
 ## Current Status
-**Active milestone:** M5 (Disaggregation)
-**Last completed:** M4 (Route Programming)
+**Active milestone:** M6 (Polish)
+**Last completed:** M5 (Disaggregation)
 **Blockers:** None
 
 ## Overview
@@ -426,7 +426,54 @@ is always loaded on deploy.
 - SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M5: Disaggregation
-<!-- filled in after M5 gate passes -->
+
+### Decisions Log
+
+#### M5: Overload Bit on Leaf Node TIEs
+**Choice:** Leaves unconditionally set `Flags.Overload = true` on their North Node TIE
+**Why:** RFC 9692 Section 6.8.2 states leaf nodes SHOULD set the overload attribute
+on all originated Node TIEs. Overloaded nodes are terminal-only in S-SPF: their
+prefixes are reachable but they are not transited. This prevents spines from
+attempting to route through leaves to reach other leaves.
+
+#### M5: Disaggregation Computation in SPF Package
+**Choice:** `internal/spf/disagg.go` computes positive disaggregation after S-SPF
+**Why:** The disaggregation algorithm (RFC 9692 Section 6.5.1) requires the S-SPF
+result (reachable prefixes with next-hops) plus reflected South Node TIEs from
+same-level peers. Placing it in the `spf` package keeps route computation logic
+together. The agent mediates between `spf` and `tie` packages: it runs the
+computation, then sends the result to the flood engine via `DisaggUpdateCh` for
+TIE origination.
+
+#### M5: Disaggregation TIE Withdrawal via Empty TIE
+**Choice:** Withdraw by originating an empty positive disagg TIE with bumped sequence number
+**Why:** Simply removing the TIE from the local LSDB causes TIDE convergence to
+re-request it from peers who still have the old version, creating an oscillation.
+Originating an empty TIE with a higher sequence number propagates the withdrawal
+through normal TIDE/TIRE synchronization. Peers receive the empty version and
+remove the disaggregated routes from their RIBs.
+
+#### M5: Spine2 Disaggregates (Not Spine1)
+**Choice:** The spine that still has connectivity to the affected leaf disaggregates
+**Why:** Per RFC 9692 Section 6.5.1, a node disaggregates prefixes reachable via
+its south neighbors that other same-level peers cannot reach. When spine1 loses
+its link to leaf3, spine2 (which still has the link) detects that spine1's
+reflected South Node TIE no longer lists leaf3. Spine2 then originates a South
+Positive Disaggregation Prefix TIE containing leaf3's prefixes, attracting traffic
+from leaves that would otherwise blackhole via spine1.
+
+### Gate Results
+- Disable spine1-leaf3 link: spine2 originates South Positive Disaggregation Prefix TIE
+- leaf1 and leaf2 install leaf3's /32 and /24 via spine2 only (more-specific wins over default)
+- Default route 0.0.0.0/0 still has ECMP via both spines
+- Ping from host1 to host3: 0% packet loss throughout
+- Re-enable spine1-leaf3 link: spine2 withdraws disaggregation TIE (empty version with bumped seq)
+- leaf1 and leaf2 revert to default route only
+- Ping continues working throughout
+- Overload bit set on all leaf North Node TIEs
+- S-SPF respects overload bit (terminal-only, no transit)
+- All tests: 79 tests passing (encoding 4, LIE FSM 17, transport 4, TIE 18, SPF 36)
+- SR Linux version: v26.3.1, NDK proto v0.5.0
 
 ## M6: Polish
 <!-- filled in after M6 gate passes -->

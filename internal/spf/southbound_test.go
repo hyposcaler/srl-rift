@@ -256,6 +256,53 @@ func TestComputeSouthbound(t *testing.T) {
 			}(),
 			wantRoutes: 0,
 		},
+		{
+			name:     "overloaded_node_terminal_only",
+			systemID: spine1,
+			level:    1,
+			adjacencies: map[string]tie.AdjacencyInfo{
+				"ethernet-1/1": makeAdj("ethernet-1/1", leaf1, 0, "10.1.1.1"),
+			},
+			entries: func() map[encoding.TIEID]*tie.LSDBEntry {
+				m := make(map[encoding.TIEID]*tie.LSDBEntry)
+				// Spine1 South Node TIE lists leaf1.
+				id, e := makeNodeTIE(encoding.TieDirectionSouth, spine1, 1, map[encoding.SystemIDType]*encoding.NodeNeighborsTIEElement{
+					leaf1: {Level: 0},
+				})
+				m[id] = e
+				// Leaf1 North Node TIE with backlink.
+				id, e = makeNodeTIE(encoding.TieDirectionNorth, leaf1, 0, map[encoding.SystemIDType]*encoding.NodeNeighborsTIEElement{
+					spine1: {Level: 1},
+				})
+				m[id] = e
+				// Leaf1's South Node TIE with overload flag (leaves are overloaded).
+				overloaded := true
+				sID := encoding.TIEID{
+					Direction:  encoding.TieDirectionSouth,
+					Originator: leaf1,
+					TIEType:    encoding.TIETypeNodeTIEType,
+					TIENr:      1,
+				}
+				m[sID] = &tie.LSDBEntry{
+					Packet: &encoding.TIEPacket{
+						Header:  encoding.TIEHeader{TIEID: sID, SeqNr: 1},
+						Element: encoding.TIEElement{Node: &encoding.NodeTIEElement{Level: 0, Flags: &encoding.NodeFlags{Overload: &overloaded}}},
+					},
+					RemainingLifetime: 3600,
+				}
+				// Leaf1 North Prefix TIE (should still be reachable).
+				id, e = makePrefixTIE(encoding.TieDirectionNorth, leaf1, []encoding.PrefixEntry{
+					{Prefix: ipv4Prefix(0x0A0A0A0A, 32), Attributes: encoding.PrefixAttributes{Metric: 0}},
+				})
+				m[id] = e
+				return m
+			}(),
+			wantRoutes: 1,
+			check: func(t *testing.T, rib RIB) {
+				// Prefix is reachable but leaf1 is not transited.
+				assertRoute(t, rib, "10.10.10.10/32", 1, 1, encoding.RouteTypeNorthPrefix)
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

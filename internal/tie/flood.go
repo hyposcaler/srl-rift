@@ -58,10 +58,11 @@ type FloodEngine struct {
 	localPrefixes []LocalPrefix
 
 	// Channels.
-	AdjChangeCh  chan AdjacencyChange  // from agent
-	FloodRecvCh  chan ReceivedFloodPkt // from transport
-	FloodSendCh  chan FloodPacket      // to transport
-	LSDBChangeCh chan struct{}          // notifies SPF of LSDB mutations
+	AdjChangeCh    chan AdjacencyChange      // from agent
+	FloodRecvCh    chan ReceivedFloodPkt     // from transport
+	FloodSendCh    chan FloodPacket          // to transport
+	LSDBChangeCh   chan struct{}              // notifies SPF of LSDB mutations
+	DisaggUpdateCh chan []encoding.PrefixEntry // from agent: disaggregation prefixes
 
 	logger *slog.Logger
 }
@@ -88,10 +89,11 @@ func NewFloodEngine(
 		nodeName:      nodeName,
 		adjacencies:   make(map[string]*adjFloodState),
 		localPrefixes: localPrefixes,
-		AdjChangeCh:   make(chan AdjacencyChange, 16),
-		FloodRecvCh:   make(chan ReceivedFloodPkt, 64),
-		FloodSendCh:   make(chan FloodPacket, 256),
-		LSDBChangeCh:  make(chan struct{}, 1),
+		AdjChangeCh:    make(chan AdjacencyChange, 16),
+		FloodRecvCh:    make(chan ReceivedFloodPkt, 64),
+		FloodSendCh:    make(chan FloodPacket, 256),
+		LSDBChangeCh:   make(chan struct{}, 1),
+		DisaggUpdateCh: make(chan []encoding.PrefixEntry, 1),
 		logger:        logger,
 	}
 }
@@ -159,6 +161,9 @@ func (fe *FloodEngine) Run(ctx context.Context) error {
 
 		case <-txTicker.C:
 			fe.drainQueues()
+
+		case prefixes := <-fe.DisaggUpdateCh:
+			fe.handleDisaggUpdate(prefixes)
 		}
 	}
 }
@@ -187,6 +192,16 @@ func (fe *FloodEngine) handleAdjChange(change AdjacencyChange) {
 		fe.floodTIEToAll(id)
 	}
 	fe.notifyLSDBChange()
+}
+
+// handleDisaggUpdate processes a disaggregation prefix update from the agent.
+// Originates or withdraws a South Positive Disaggregation Prefix TIE.
+func (fe *FloodEngine) handleDisaggUpdate(prefixes []encoding.PrefixEntry) {
+	id, changed := fe.OriginatePositiveDisaggTIE(prefixes)
+	if changed {
+		fe.floodTIEToAll(id)
+		fe.notifyLSDBChange()
+	}
 }
 
 // handleFloodPacket dispatches an incoming packet to the correct handler.

@@ -60,6 +60,12 @@ func ComputeSouthbound(
 			continue // no southbound adjacencies known
 		}
 
+		// Overloaded nodes are terminal: attach their prefixes but do not
+		// transit through them (RFC 9692 Section 6.8.2).
+		if southNode.Flags != nil && southNode.Flags.Overload != nil && *southNode.Flags.Overload {
+			continue
+		}
+
 		for neighborID, neighborEntry := range southNode.Neighbors {
 			// S-SPF only traverses southbound: neighbor must be at lower level.
 			if neighborEntry.Level >= southNode.Level {

@@ -16,6 +16,9 @@ milestone listed. Just continue from where it left off.
 - `go test ./...`
 - Deploy to lab: `bash lab/scripts/deploy.sh --build`
 
+## git rules
+- before starting work on a new milestone, make sure to create a commit for the previous milestone.
+
 ## Code Conventions
 - No em-dashes. Use commas, parentheses, or separate sentences.
 - Table-driven tests.

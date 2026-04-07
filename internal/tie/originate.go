@@ -60,16 +60,20 @@ func (fe *FloodEngine) originateNorthNodeTIE() (encoding.TIEID, bool) {
 		}
 	}
 
-	element := encoding.TIEElement{
-		Node: &encoding.NodeTIEElement{
-			Level:     fe.level,
-			Neighbors: neighbors,
-			Capabilities: encoding.NodeCapabilities{
-				ProtocolMinorVersion: encoding.ProtocolMinorVersion,
-			},
-			Name: fe.nodeName,
+	node := &encoding.NodeTIEElement{
+		Level:     fe.level,
+		Neighbors: neighbors,
+		Capabilities: encoding.NodeCapabilities{
+			ProtocolMinorVersion: encoding.ProtocolMinorVersion,
 		},
+		Name: fe.nodeName,
 	}
+	// Leaves set overload per RFC 9692 Section 6.8.2.
+	if fe.level == encoding.LeafLevel {
+		node.Flags = &encoding.NodeFlags{Overload: boolPtr(true)}
+	}
+
+	element := encoding.TIEElement{Node: node}
 
 	return id, fe.insertSelfOriginated(id, element)
 }
@@ -230,6 +234,54 @@ func (fe *FloodEngine) bumpOwnTIE(id encoding.TIEID) {
 
 	fe.lsdb.Insert(existing)
 }
+
+// OriginatePositiveDisaggTIE creates or withdraws a South Positive
+// Disaggregation Prefix TIE. If prefixes is non-empty, the TIE is
+// originated (or updated). If empty and a previous TIE exists, it is removed.
+// Returns the TIEID and whether the LSDB was changed.
+func (fe *FloodEngine) OriginatePositiveDisaggTIE(prefixes []encoding.PrefixEntry) (encoding.TIEID, bool) {
+	id := encoding.TIEID{
+		Direction:  encoding.TieDirectionSouth,
+		Originator: fe.systemID,
+		TIEType:    encoding.TIETypePositiveDisaggregationPrefixTIEType,
+		TIENr:      1,
+	}
+
+	if len(prefixes) == 0 {
+		existing := fe.lsdb.Get(id)
+		if existing == nil || !existing.SelfOriginated {
+			return id, false
+		}
+		// Check if already empty (already withdrawn).
+		if existing.Packet.Element.PositiveDisaggregationPrefixes != nil &&
+			len(existing.Packet.Element.PositiveDisaggregationPrefixes.Prefixes) == 0 {
+			return id, false
+		}
+		// Withdraw: originate empty TIE with bumped sequence number.
+		// TIDE/TIRE will propagate the empty version to peers.
+		element := encoding.TIEElement{
+			PositiveDisaggregationPrefixes: &encoding.PrefixTIEElement{},
+		}
+		fe.insertSelfOriginated(id, element)
+		fe.logger.Info("disaggregation: withdrew positive disagg TIE")
+		return id, true
+	}
+
+	element := encoding.TIEElement{
+		PositiveDisaggregationPrefixes: &encoding.PrefixTIEElement{
+			Prefixes: prefixes,
+		},
+	}
+
+	changed := fe.insertSelfOriginated(id, element)
+	if changed {
+		fe.logger.Info("disaggregation: originated positive disagg TIE",
+			"prefix_count", len(prefixes))
+	}
+	return id, changed
+}
+
+func boolPtr(v bool) *bool { return &v }
 
 // IPv4ToPrefix converts a netip.Addr and prefix length to an IPPrefixType.
 func IPv4ToPrefix(addr netip.Addr, prefixLen int8) encoding.IPPrefixType {

@@ -17,8 +17,9 @@ type Engine struct {
 	adjFn    func() map[string]tie.AdjacencyInfo
 	logger   *slog.Logger
 
-	rib   RIB
-	ribMu sync.RWMutex
+	rib      RIB
+	southRIB RIB // S-SPF result before merging N-SPF (for disaggregation)
+	ribMu    sync.RWMutex
 }
 
 // NewEngine creates an SPF engine. Call Run() to trigger computation.
@@ -45,13 +46,18 @@ func (e *Engine) Run() {
 	adjacencies := e.adjFn()
 
 	var rib RIB
+	var sRIB RIB
 
 	if e.level == encoding.LeafLevel {
 		// Leaf: northbound only (leaf optimization).
 		rib = ComputeNorthbound(e.systemID, e.level, adjacencies, entries, e.logger)
 	} else {
 		// Spine/higher: southbound Dijkstra + northbound for default route.
-		rib = ComputeSouthbound(e.systemID, e.level, adjacencies, entries, e.logger)
+		sRIB = ComputeSouthbound(e.systemID, e.level, adjacencies, entries, e.logger)
+		rib = make(RIB, len(sRIB))
+		for k, v := range sRIB {
+			rib[k] = v
+		}
 
 		// Also compute northbound reachability (default route from above).
 		northRIB := ComputeNorthbound(e.systemID, e.level, adjacencies, entries, e.logger)
@@ -62,6 +68,7 @@ func (e *Engine) Run() {
 
 	e.ribMu.Lock()
 	e.rib = rib
+	e.southRIB = sRIB
 	e.ribMu.Unlock()
 
 	e.logRIB(rib)
@@ -73,6 +80,21 @@ func (e *Engine) RIB() RIB {
 	defer e.ribMu.RUnlock()
 	result := make(RIB, len(e.rib))
 	for k, v := range e.rib {
+		result[k] = v
+	}
+	return result
+}
+
+// SouthRIB returns a copy of the last S-SPF result (before N-SPF merge).
+// Used by disaggregation computation on spines.
+func (e *Engine) SouthRIB() RIB {
+	e.ribMu.RLock()
+	defer e.ribMu.RUnlock()
+	if e.southRIB == nil {
+		return nil
+	}
+	result := make(RIB, len(e.southRIB))
+	for k, v := range e.southRIB {
 		result[k] = v
 	}
 	return result

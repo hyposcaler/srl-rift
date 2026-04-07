@@ -2,6 +2,7 @@ package spf
 
 import (
 	"fmt"
+	"net/netip"
 
 	"github.com/hyposcaler/srl-rift/internal/encoding"
 	"github.com/hyposcaler/srl-rift/internal/tie"
@@ -50,6 +51,36 @@ func FindPrefixTIEs(entries map[encoding.TIEID]*tie.LSDBEntry, dir encoding.TieD
 		if id.Direction == dir && id.Originator == originator && id.TIEType == encoding.TIETypePrefixTIEType {
 			if entry.Packet.Element.Prefixes != nil {
 				result = append(result, entry.Packet.Element.Prefixes)
+			}
+		}
+	}
+	return result
+}
+
+// StringToPrefix converts a "a.b.c.d/len" string to an IPPrefixType.
+func StringToPrefix(s string) encoding.IPPrefixType {
+	prefix, err := netip.ParsePrefix(s)
+	if err != nil || !prefix.Addr().Is4() {
+		return encoding.IPPrefixType{}
+	}
+	raw := prefix.Addr().As4()
+	addr := encoding.IPv4Address(int32(raw[0])<<24 | int32(raw[1])<<16 | int32(raw[2])<<8 | int32(raw[3]))
+	return encoding.IPPrefixType{
+		IPv4Prefix: &encoding.IPv4PrefixType{
+			Address:   addr,
+			PrefixLen: encoding.PrefixLenType(prefix.Bits()),
+		},
+	}
+}
+
+// FindPositiveDisaggPrefixTIEs returns all Positive Disaggregation Prefix TIE
+// elements for a direction and originator.
+func FindPositiveDisaggPrefixTIEs(entries map[encoding.TIEID]*tie.LSDBEntry, dir encoding.TieDirectionType, originator encoding.SystemIDType) []*encoding.PrefixTIEElement {
+	var result []*encoding.PrefixTIEElement
+	for id, entry := range entries {
+		if id.Direction == dir && id.Originator == originator && id.TIEType == encoding.TIETypePositiveDisaggregationPrefixTIEType {
+			if entry.Packet.Element.PositiveDisaggregationPrefixes != nil {
+				result = append(result, entry.Packet.Element.PositiveDisaggregationPrefixes)
 			}
 		}
 	}

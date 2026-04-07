@@ -107,6 +107,19 @@ func ComputeNorthbound(
 				addRoute(rib, prefix, totalCost, encoding.RouteTypeSouthPrefix, []NextHop{v.nextHop})
 			}
 		}
+
+		// Attach South Positive Disaggregation Prefix TIEs.
+		disaggTIEs := FindPositiveDisaggPrefixTIEs(entries, encoding.TieDirectionSouth, v.nextHop.NeighborID)
+		for _, pt := range disaggTIEs {
+			for _, pe := range pt.Prefixes {
+				prefix := PrefixToString(pe.Prefix)
+				if prefix == "" {
+					continue
+				}
+				totalCost := pe.Attributes.Metric + v.linkCost
+				addRoute(rib, prefix, totalCost, encoding.RouteTypeSouthPrefix, []NextHop{v.nextHop})
+			}
+		}
 	}
 
 	return rib
